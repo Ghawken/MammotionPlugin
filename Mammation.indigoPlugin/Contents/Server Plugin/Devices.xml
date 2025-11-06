@@ -1,0 +1,81 @@
+<?xml version="1.0"?>
+<Devices>
+    <Device type="custom" id="mammotionMower">
+        <Name>Mammotion Mower</Name>
+        <ConfigUI>
+            <Field id="account" type="textfield">
+                <Label>Account (email or account id):</Label>
+            </Field>
+            <Field id="password" type="textfield">
+                <Label>Cloud Password:</Label>
+            </Field>
+            <Field id="deviceName" type="textfield">
+                <Label>Mower Name (optional):</Label>
+                <Description>Optional: exact mower name to control (as shown in Mammotion app). Leave blank to use the first mower on the account.</Description>
+            </Field>
+        </ConfigUI>
+
+        <States>
+            <!-- Connection/auth -->
+            <State id="connected"><ValueType>Boolean</ValueType><TriggerLabel>Connected</TriggerLabel><ControlPageLabel>Connected</ControlPageLabel></State>
+            <State id="auth_ok"><ValueType>Boolean</ValueType><TriggerLabel>Authenticated</TriggerLabel><ControlPageLabel>Authenticated</ControlPageLabel></State>
+            <State id="status_text"><ValueType>String</ValueType><TriggerLabel>Status Text</TriggerLabel><ControlPageLabel>Status</ControlPageLabel></State>
+            <State id="last_update"><ValueType>String</ValueType><TriggerLabel>Last Update</TriggerLabel><ControlPageLabel>Last Update</ControlPageLabel></State>
+
+            <State id="blade_rpm"><ValueType>Integer</ValueType><TriggerLabel>Blade RPM</TriggerLabel><ControlPageLabel>Blade RPM</ControlPageLabel></State>
+<State id="blade_mode"><ValueType>String</ValueType><TriggerLabel>Blade Mode</TriggerLabel><ControlPageLabel>Blade Mode</ControlPageLabel></State>
+<State id="traversal_mode"><ValueType>String</ValueType><TriggerLabel>Traversal Mode</TriggerLabel><ControlPageLabel>Traversal Mode</ControlPageLabel></State>
+<State id="turning_mode"><ValueType>String</ValueType><TriggerLabel>Turning Mode</TriggerLabel><ControlPageLabel>Turning Mode</ControlPageLabel></State>
+<State id="model_name"><ValueType>String</ValueType><TriggerLabel>Model</TriggerLabel><ControlPageLabel>Model</ControlPageLabel></State>
+
+<!-- Position/GNSS/RTK -->
+<State id="pos_x"><ValueType>Number</ValueType><TriggerLabel>Pos X (m)</TriggerLabel><ControlPageLabel>Pos X</ControlPageLabel></State>
+<State id="pos_y"><ValueType>Number</ValueType><TriggerLabel>Pos Y (m)</TriggerLabel><ControlPageLabel>Pos Y</ControlPageLabel></State>
+<State id="pos_type"><ValueType>Integer</ValueType><TriggerLabel>Position Type</TriggerLabel><ControlPageLabel>Pos Type</ControlPageLabel></State>
+<State id="pos_level"><ValueType>Integer</ValueType><TriggerLabel>Position Level</TriggerLabel><ControlPageLabel>Pos Level</ControlPageLabel></State>
+<State id="lat_std"><ValueType>Number</ValueType><TriggerLabel>Lat Std (m)</TriggerLabel><ControlPageLabel>Lat Std</ControlPageLabel></State>
+<State id="lon_std"><ValueType>Number</ValueType><TriggerLabel>Lon Std (m)</TriggerLabel><ControlPageLabel>Lon Std</ControlPageLabel></State>
+<State id="satellites_total"><ValueType>Integer</ValueType><TriggerLabel>Satellites (Total)</TriggerLabel><ControlPageLabel>Sats Total</ControlPageLabel></State>
+<State id="satellites_l2"><ValueType>Integer</ValueType><TriggerLabel>Satellites (L2)</TriggerLabel><ControlPageLabel>Sats L2</ControlPageLabel></State>
+<State id="rtk_age"><ValueType>Integer</ValueType><TriggerLabel>RTK Age (s)</TriggerLabel><ControlPageLabel>RTK Age</ControlPageLabel></State>
+<State id="toward"><ValueType>Integer</ValueType><TriggerLabel>Heading</TriggerLabel><ControlPageLabel>Heading</ControlPageLabel></State>
+<State id="zone_hash"><ValueType>String</ValueType><TriggerLabel>Area Hash</TriggerLabel><ControlPageLabel>Area Hash</ControlPageLabel></State>
+
+            <!-- Power/charging -->
+            <State id="battery_percent"><ValueType>Integer</ValueType><TriggerLabel>Battery (%)</TriggerLabel><ControlPageLabel>Battery (%)</ControlPageLabel></State>
+            <State id="charging"><ValueType>Boolean</ValueType><TriggerLabel>Charging</TriggerLabel><ControlPageLabel>Charging</ControlPageLabel></State>
+            <State id="docked"><ValueType>Boolean</ValueType><TriggerLabel>Docked</TriggerLabel><ControlPageLabel>Docked</ControlPageLabel></State>
+
+            <!-- Operation -->
+            <State id="mowing"><ValueType>Boolean</ValueType><TriggerLabel>Mowing</TriggerLabel><ControlPageLabel>Mowing</ControlPageLabel></State>
+            <State id="blades_on"><ValueType>Boolean</ValueType><TriggerLabel>Blades On</TriggerLabel><ControlPageLabel>Blades</ControlPageLabel></State>
+            <State id="work_mode"><ValueType>String</ValueType><TriggerLabel>Work Mode</TriggerLabel><ControlPageLabel>Work Mode</ControlPageLabel></State>
+            <State id="state_raw"><ValueType>String</ValueType><TriggerLabel>State (raw)</TriggerLabel><ControlPageLabel>State Raw</ControlPageLabel></State>
+            <State id="state_summary"><ValueType>String</ValueType><TriggerLabel>State Summary</TriggerLabel><ControlPageLabel>Summary</ControlPageLabel></State>
+            <State id="error_text"><ValueType>String</ValueType><TriggerLabel>Error</TriggerLabel><ControlPageLabel>Error</ControlPageLabel></State>
+            <State id="safety_status"><ValueType>String</ValueType><TriggerLabel>Safety</TriggerLabel><ControlPageLabel>Safety</ControlPageLabel></State>
+
+            <!-- Extras (human-readable) -->
+            <State id="area_name"><ValueType>String</ValueType><TriggerLabel>Area Name</TriggerLabel><ControlPageLabel>Area</ControlPageLabel></State>
+            <State id="progress_percent"><ValueType>Integer</ValueType><TriggerLabel>Progress (%)</TriggerLabel><ControlPageLabel>Progress (%)</ControlPageLabel></State>
+            <State id="blade_height_mm"><ValueType>Integer</ValueType><TriggerLabel>Blade Height (mm)</TriggerLabel><ControlPageLabel>Blade Height</ControlPageLabel></State>
+            <State id="speed_mode"><ValueType>String</ValueType><TriggerLabel>Speed Mode</TriggerLabel><ControlPageLabel>Speed Mode</ControlPageLabel></State>
+            <State id="wifi_rssi"><ValueType>Integer</ValueType><TriggerLabel>Wi‑Fi RSSI (dBm)</TriggerLabel><ControlPageLabel>Wi‑Fi RSSI</ControlPageLabel></State>
+            <State id="fw_version"><ValueType>String</ValueType><TriggerLabel>Firmware Version</TriggerLabel><ControlPageLabel>Firmware</ControlPageLabel></State>
+            <State id="rain_detected"><ValueType>Boolean</ValueType><TriggerLabel>Rain Detected</TriggerLabel><ControlPageLabel>Rain</ControlPageLabel></State>
+            <State id="obstacle_count"><ValueType>Integer</ValueType><TriggerLabel>Obstacle Count</TriggerLabel><ControlPageLabel>Obstacles</ControlPageLabel></State>
+            <State id="lock_active"><ValueType>Boolean</ValueType><TriggerLabel>Lock Active</TriggerLabel><ControlPageLabel>Lock</ControlPageLabel></State>
+            <State id="tilt_alarm"><ValueType>Boolean</ValueType><TriggerLabel>Tilt Alarm</TriggerLabel><ControlPageLabel>Tilt Alarm</ControlPageLabel></State>
+            <State id="lift_alarm"><ValueType>Boolean</ValueType><TriggerLabel>Lift Alarm</TriggerLabel><ControlPageLabel>Lift Alarm</ControlPageLabel></State>
+
+            <!-- Position -->
+            <State id="gps_lat"><ValueType>Number</ValueType><TriggerLabel>Latitude</TriggerLabel><ControlPageLabel>Lat</ControlPageLabel></State>
+            <State id="gps_lon"><ValueType>Number</ValueType><TriggerLabel>Longitude</TriggerLabel><ControlPageLabel>Lon</ControlPageLabel></State>
+
+            <!-- Relay compatibility -->
+            <State id="onOffState"><ValueType>Boolean</ValueType><TriggerLabel>On/Off</TriggerLabel><ControlPageLabel>On/Off</ControlPageLabel></State>
+        </States>
+
+        <UiDisplayStateId>state_summary</UiDisplayStateId>
+    </Device>
+</Devices>

@@ -1,0 +1,214 @@
+<?xml version="1.0"?>
+<Actions>
+    <Action id="startMowing" deviceFilter="self">
+        <Name>Start Mowing</Name>
+        <CallbackMethod>start_mowing_action</CallbackMethod>
+    </Action>
+    <Action id="pauseMowing" deviceFilter="self">
+        <Name>Pause Mowing</Name>
+        <CallbackMethod>pause_mowing_action</CallbackMethod>
+    </Action>
+    <Action id="returnHome" deviceFilter="self">
+        <Name>Return to Dock</Name>
+        <CallbackMethod>return_home_action</CallbackMethod>
+    </Action>
+
+    <!-- New: Start Mowing with dynamic Areas menu -->
+    <Action id="startMowingAreas" deviceFilter="self">
+        <Name>Start Mowing (Select Areas)</Name>
+        <CallbackMethod>start_mowing_areas_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="areas" type="list" selectionType="multiple">
+                <Label>Areas to mow:</Label>
+                <List class="self" method="areas_menu" dynamicReload="true"/>
+            </Field>
+            <Field id="areasNote" type="label" fontColor="darkgray" fontSize="small">
+                <Label>If empty, the mower may reuse its last plan. Open again if list says “Fetching…”</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <!-- New: Deep dump for troubleshooting library state -->
+    <Action id="dumpAllState" deviceFilter="self">
+        <Name>Dump All Library Fields</Name>
+        <CallbackMethod>dump_all_state_action</CallbackMethod>
+    </Action>
+        <Action id="selectWorkArea" deviceFilter="self">
+        <Name>Select Work Area</Name>
+        <CallbackMethod>select_area_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="areaHash" type="menu">
+                <Label>Choose area:</Label>
+                <List class="self" method="area_menu" dynamicReload="true"/>
+            </Field>
+            <Field id="info" type="label" fontColor="darkgray" fontSize="small">
+                <Label>This writes the selected area’s name to the “area_name” state and its hash to “zone_hash”.</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="refreshAreaList" deviceFilter="self">
+        <Name>Refresh Area List</Name>
+        <CallbackMethod>refresh_area_list_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="note" type="label" fontColor="darkgray" fontSize="small">
+                <Label>Forces a map sync and area-name fetch from the mower. The areas menu will update after messages arrive.</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+        <Action id="setRainDetection" deviceFilter="self">
+        <Name>Set Rain Detection</Name>
+        <CallbackMethod>set_rain_detection_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="onOff" type="checkbox" defaultValue="true">
+                <Label>Enable rain detection</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="readRainDetection" deviceFilter="self">
+        <Name>Read Rain Detection</Name>
+        <CallbackMethod>read_rain_detection_action</CallbackMethod>
+    </Action>
+
+    <Action id="setSidelight" deviceFilter="self">
+        <Name>Set Sidelight Mode</Name>
+        <CallbackMethod>set_sidelight_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="mode" type="menu" defaultValue="1">
+                <Label>Mode:</Label>
+                <List>
+                    <Option value="0">Off</Option>
+                    <Option value="1">On</Option>
+                    <Option value="2">Auto</Option>
+                </List>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="readSidelight" deviceFilter="self">
+        <Name>Read Sidelight</Name>
+        <CallbackMethod>read_sidelight_action</CallbackMethod>
+    </Action>
+    <Action id="setManualLight" deviceFilter="self">
+        <Name>Set Manual Light</Name>
+        <CallbackMethod>set_manual_light_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="manual" type="checkbox" defaultValue="false">
+                <Label>Manual control enabled</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="setNightLight" deviceFilter="self">
+        <Name>Set Night Light</Name>
+        <CallbackMethod>set_night_light_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="night" type="checkbox" defaultValue="false">
+                <Label>Night light enabled</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="setTraversalMode" deviceFilter="self">
+        <Name>Set Traversal Mode</Name>
+        <CallbackMethod>set_traversal_mode_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="mode" type="textfield" defaultValue="0">
+                <Label>Traversal mode (int)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="setTurningMode" deviceFilter="self">
+        <Name>Set Turning Mode</Name>
+        <CallbackMethod>set_turning_mode_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="mode" type="textfield" defaultValue="0">
+                <Label>Turning mode (int)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="setBladeHeight" deviceFilter="self">
+        <Name>Set Blade Height (mm)</Name>
+        <CallbackMethod>blade_height_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="height" type="textfield" defaultValue="60">
+                <Label>Height (mm)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="setCutterSpeedMode" deviceFilter="self">
+        <Name>Set Cutter Speed Mode</Name>
+        <CallbackMethod>cutter_speed_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="mode" type="textfield" defaultValue="0">
+                <Label>Mode (int)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="setMowingSpeed" deviceFilter="self">
+        <Name>Set Mowing Speed (m/s)</Name>
+        <CallbackMethod>set_speed_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="speed" type="textfield" defaultValue="0.25">
+                <Label>Speed (m/s)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="leaveDock" deviceFilter="self">
+        <Name>Leave Dock</Name>
+        <CallbackMethod>leave_dock_action</CallbackMethod>
+    </Action>
+    <Action id="cancelTask" deviceFilter="self">
+        <Name>Cancel Task</Name>
+        <CallbackMethod>cancel_task_action</CallbackMethod>
+    </Action>
+
+    <Action id="moveForward" deviceFilter="self">
+        <Name>Move Forward</Name>
+        <CallbackMethod>move_forward_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="speed" type="textfield" defaultValue="0.2">
+                <Label>Speed (m/s)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="moveBack" deviceFilter="self">
+        <Name>Move Back</Name>
+        <CallbackMethod>move_back_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="speed" type="textfield" defaultValue="0.2">
+                <Label>Speed (m/s)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="moveLeft" deviceFilter="self">
+        <Name>Move Left</Name>
+        <CallbackMethod>move_left_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="speed" type="textfield" defaultValue="0.2">
+                <Label>Speed (m/s)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="moveRight" deviceFilter="self">
+        <Name>Move Right</Name>
+        <CallbackMethod>move_right_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="speed" type="textfield" defaultValue="0.2">
+                <Label>Speed (m/s)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+    <Action id="requestIotSync" deviceFilter="self">
+        <Name>Request IoT Sync</Name>
+        <CallbackMethod>request_iot_sync_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="stop" type="checkbox" defaultValue="false">
+                <Label>Stop reporting (leave unchecked to start)</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+
+</Actions>

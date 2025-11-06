@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<PluginConfig>
+    <SupportURL>https://github.com/mikey0000/PyMammotion</SupportURL>
+
+    <Field id="infoLabel0" type="label" fontSize="large" fontColor="blue">
+        <Label>Mammotion Mower Indigo Plugin</Label>
+    </Field>
+    <Field id="about" type="label" fontColor="darkgray" fontSize="small">
+        <Label>Controls and monitors Mammotion mowers (Luba, Luba 2, Yuka) via PyMammotion (Cloud or MQTT). Configure logging below.</Label>
+    </Field>
+
+    <Field id="showDebugLevel" type="menu" defaultValue="20">
+        <Label>Indigo Log Debug level:</Label>
+        <List>
+            <Option value="5">Detailed Debugging</Option>
+            <Option value="10">Debug</Option>
+            <Option value="20">Info</Option>
+            <Option value="30">Warning</Option>
+            <Option value="40">Error</Option>
+            <Option value="50">Critical</Option>
+        </List>
+    </Field>
+    <Field id="showDebugFileLevel" type="menu" defaultValue="10">
+        <Label>File Debug level:</Label>
+        <List>
+            <Option value="5">Detailed Debugging</Option>
+            <Option value="10">Debug</Option>
+            <Option value="20">Info</Option>
+            <Option value="30">Warning</Option>
+            <Option value="40">Error</Option>
+            <Option value="50">Critical</Option>
+        </List>
+    </Field>
+
+    <Field id="debugLibrary" type="checkbox" defaultValue="false">
+        <Label>Enable PyMammotion library debug</Label>
+        <Description>Route PyMammotion DEBUG logs to Indigo Event Log and plugin file log</Description>
+    </Field>
+</PluginConfig>

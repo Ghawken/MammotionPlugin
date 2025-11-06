@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<MenuItems>
+               <MenuItem id="mower-devices">
+        <Name>Log all </Name>
+        <CallbackMethod>log_raw_state_action</CallbackMethod>
+    </MenuItem>
+</MenuItems>
