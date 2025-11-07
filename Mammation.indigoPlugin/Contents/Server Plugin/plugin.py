@@ -1252,15 +1252,17 @@ class Plugin(indigo.PluginBase):
         except Exception:
             return None
         return None
-
+##
     async def _refresh_states(self, dev_id: int):
         """
-        Update Indigo states (human-readable) and add a combined status line, e.g.:
+        Update Indigo states and a combined, human-readable status line, e.g.:
           - "Mowing <area>, remaining <n>%, battery <b>%"
+          - "Returning to Dock (battery <b>%)"
           - "Docked and Charging"
           - "Docked, Not Charging"
           - "Idle, Not Charging"
           - "Error: <message>"
+        Plus robust blades_on detection (cut_knife_ctrl | blade_status) and optional blade_rpm.
         """
         dev = indigo.devices.get(dev_id)
         if not dev:
@@ -1290,7 +1292,7 @@ class Plugin(indigo.PluginBase):
             location = getattr(mowing_device, "location", None)
             map_obj = getattr(mowing_device, "map", None)
 
-            # Presence/log snapshot (safe stats)
+            # Presence snapshot
             try:
                 names_cnt = len(getattr(map_obj, "area_name", []) or [])
             except Exception:
@@ -1300,14 +1302,6 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 areas_cnt = 0
             wz = getattr(location, "work_zone", None) if location else None
-
-            self.logger.debug(
-                f"_refresh_states: sources for '{name}': "
-                f"report_data={bool(report_data)} dev={bool(dev_status)} work={bool(work)} "
-                f"connect={bool(connect)} rtk={bool(rtk)} local={bool(local_status)} "
-                f"maintenance={bool(maintenance)} vision={bool(vision_info)} "
-                f"location={bool(location)} work_zone={wz} map.names={names_cnt} map.areas={areas_cnt}"
-            )
 
             # Connected flag
             try:
@@ -1325,15 +1319,19 @@ class Plugin(indigo.PluginBase):
             # Work mode / raw
             sys_status = getattr(dev_status, "sys_status", None)
             mode_name = ""
+            mode_int = None
             try:
                 if sys_status is not None:
+                    mode_int = int(sys_status)
+                    # Prefer device_constant mapping
                     from pymammotion.utility.constant.device_constant import device_mode as _device_mode
-                    mode_name = str(_device_mode(int(sys_status)))
+                    mode_name = str(_device_mode(mode_int))
             except Exception:
                 try:
                     from pymammotion.utility.constant import WorkMode
                     if sys_status is not None:
-                        mode_name = WorkMode(int(sys_status)).name.replace("_", " ").title()
+                        mode_int = int(sys_status)
+                        mode_name = WorkMode(mode_int).name.replace("_", " ").title()
                 except Exception:
                     mode_name = f"Status {sys_status}" if sys_status is not None else ""
 
@@ -1363,12 +1361,32 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 self.logger.exception("charging decode failed")
 
-            # Blades / model/fw / rain
+            # Blades: robust detection (cut_knife_ctrl first; fall back to blade_status)
+            blades_on_val = None
             try:
-                if "blades_on" in allowed:
-                    kv.append({"key": "blades_on", "value": bool(getattr(mower_state, "blade_status", False))})
-                if "blade_rpm" in allowed and getattr(mower_state, "blade_rpm", None) is not None:
-                    kv.append({"key": "blade_rpm", "value": int(getattr(mower_state, "blade_rpm", 0))})
+                # Primary: device 'dev' section often exposes cutter on/off
+                ck = getattr(dev_status, "cut_knife_ctrl", None)
+                if ck is not None:
+                    blades_on_val = bool(int(ck) != 0)
+                # Fallback: mower_state.blade_status boolean (may be present on some models)
+                if blades_on_val is None:
+                    blades_on_val = bool(getattr(mower_state, "blade_status", False))
+                if "blades_on" in allowed and blades_on_val is not None:
+                    kv.append({"key": "blades_on", "value": bool(blades_on_val)})
+            except Exception:
+                self.logger.exception("blades_on decode failed")
+
+            # blade_rpm if provided (not all firmwares provide this)
+            try:
+                rpm_val = getattr(mower_state, "blade_rpm", None)
+                if rpm_val is not None and "blade_rpm" in allowed:
+                    kv.append({"key": "blade_rpm", "value": int(rpm_val)})
+            except Exception:
+                # Do not log at error level; it's optional
+                pass
+
+            # Model/FW/Rain
+            try:
                 if "model_name" in allowed and getattr(mower_state, "model", None):
                     kv.append({"key": "model_name", "value": str(getattr(mower_state, "model", ""))})
                 if "fw_version" in allowed and getattr(mower_state, "swversion", None):
@@ -1415,11 +1433,11 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 self.logger.exception("rtk block failed")
 
-            # Position source selection (local/vision/work)
+            # Position sources (local->vision->work.path)
             try:
                 src = local_status if local_status is not None else None
                 pos_x_val = pos_y_val = lat_std_val = lon_std_val = pos_type_val = pos_level_val = toward_val = None
-                pos_src = "none"
+
                 if src is not None:
                     def _num(val):
                         return None if val is None else float(val)
@@ -1431,7 +1449,6 @@ class Plugin(indigo.PluginBase):
                     pos_type_val = getattr(src, "pos_type", None)
                     pos_level_val = getattr(src, "pos_level", None)
                     toward_val = getattr(src, "toward", None)
-                    pos_src = "local"
                 else:
                     if vision_info is not None:
                         try:
@@ -1441,7 +1458,6 @@ class Plugin(indigo.PluginBase):
                             if vx is not None and vy is not None:
                                 pos_x_val = float(vx)
                                 pos_y_val = float(vy)
-                                pos_src = "vision"
                             if vh is not None:
                                 toward_val = int(round(float(vh)))
                         except Exception:
@@ -1453,7 +1469,6 @@ class Plugin(indigo.PluginBase):
                             if wpx is not None and wpy is not None:
                                 pos_x_val = float(wpx) / 1000.0
                                 pos_y_val = float(wpy) / 1000.0
-                                pos_src = "work.path_pos"
                         except Exception:
                             self.logger.exception("work.path_pos fallback parse failed")
                     if pos_type_val is None and location is not None:
@@ -1466,8 +1481,6 @@ class Plugin(indigo.PluginBase):
                             pos_level_val = getattr(rtk, "pos_level", None)
                         except Exception:
                             pass
-
-                self.logger.debug(f"_refresh_states: position source used = {pos_src}")
 
                 if pos_x_val is not None and "pos_x" in allowed:
                     kv.append({"key": "pos_x", "value": pos_x_val})
@@ -1521,79 +1534,64 @@ class Plugin(indigo.PluginBase):
             # zone_hash + area_name
             area_name_val = None
             try:
-                import math
                 if location is not None:
-                    try:
-                        lat_r = getattr(getattr(location, "RTK", None), "latitude", None)
-                        lon_r = getattr(getattr(location, "RTK", None), "longitude", None)
-                        if "gps_lat" in allowed and lat_r is not None:
-                            kv.append({"key": "gps_lat", "value": float(lat_r) * 180.0 / math.pi})
-                        if "gps_lon" in allowed and lon_r is not None:
-                            kv.append({"key": "gps_lon", "value": float(lon_r) * 180.0 / math.pi})
-                    except Exception:
-                        self.logger.exception("gps lat/lon failed")
-
-                    try:
-                        hz = getattr(location, "work_zone", None)
-                        if hz is not None:
-                            hz_int = int(hz)
-                            if "zone_hash" in allowed:
-                                kv.append({"key": "zone_hash", "value": hz_int})
-                            if "area_name" in allowed:
-                                if hz_int == 0:
-                                    area_name_val = "Not working"
-                                else:
-                                    nm = None
-                                    names = getattr(map_obj, "area_name", []) if map_obj else []
-                                    for an in (names or []):
-                                        if getattr(an, "hash", None) == hz_int:
-                                            nm = getattr(an, "name", None) or f"area {hz_int}"
-                                            break
-                                    if nm is None:
-                                        area_tbl = getattr(map_obj, "area", {}) if map_obj else {}
-                                        aentry = area_tbl.get(hz_int) if isinstance(area_tbl, dict) else None
-                                        if aentry and getattr(aentry, "data", None):
-                                            frame0 = aentry.data[0] if len(aentry.data) > 0 else None
-                                            if frame0 is not None:
-                                                for an in (names or []):
-                                                    if getattr(an, "hash", None) == getattr(frame0, "hash", None):
-                                                        nm = getattr(an, "name", None) or f"area {hz_int}"
-                                                        break
-                                    if nm is None:
-                                        nm = f"area {hz_int}"
-                                        self.logger.debug(
-                                            f"_refresh_states: could not resolve area name for hash={hz_int}; "
-                                            f"area_name_count={names_cnt}, area_count={areas_cnt}"
-                                        )
-                                    area_name_val = str(nm)
-                                    kv.append({"key": "area_name", "value": area_name_val})
-                    except Exception:
-                        self.logger.exception("work area resolution failed")
+                    hz = getattr(location, "work_zone", None)
+                    if hz is not None:
+                        hz_int = int(hz)
+                        if "zone_hash" in allowed:
+                            kv.append({"key": "zone_hash", "value": hz_int})
+                        if "area_name" in allowed:
+                            if hz_int == 0:
+                                area_name_val = "Not working"
+                            else:
+                                nm = None
+                                names = getattr(map_obj, "area_name", []) if map_obj else []
+                                for an in (names or []):
+                                    if getattr(an, "hash", None) == hz_int:
+                                        nm = getattr(an, "name", None) or f"area {hz_int}"
+                                        break
+                                if nm is None:
+                                    area_tbl = getattr(map_obj, "area", {}) if map_obj else {}
+                                    aentry = area_tbl.get(hz_int) if isinstance(area_tbl, dict) else None
+                                    if aentry and getattr(aentry, "data", None):
+                                        frame0 = aentry.data[0] if len(aentry.data) > 0 else None
+                                        if frame0 is not None:
+                                            for an in (names or []):
+                                                if getattr(an, "hash", None) == getattr(frame0, "hash", None):
+                                                    nm = getattr(an, "name", None) or f"area {hz_int}"
+                                                    break
+                                if nm is None:
+                                    nm = f"area {hz_int}"
+                                    self.logger.debug(
+                                        f"_refresh_states: could not resolve area name for hash={hz_int}; "
+                                        f"area_name_count={names_cnt}, area_count={areas_cnt}"
+                                    )
+                                area_name_val = str(nm)
+                                kv.append({"key": "area_name", "value": area_name_val})
             except Exception:
-                self.logger.exception("location block failed")
+                self.logger.exception("work area resolution failed")
 
-            # Existing summary bits (not the combined line)
+            # Summary toggles (basic flags)
             try:
-                parts = []
-                if mode_name:
-                    parts.append(mode_name)
-                if bool(getattr(mower_state, "blade_status", False)):
-                    parts.append("Blades On")
-                try:
+                if "state_summary" in allowed:
+                    parts = []
+                    if mode_name:
+                        parts.append(mode_name)
+                    if blades_on_val:
+                        parts.append("Blades On")
                     if charging:
                         parts.append("Charging")
-                except Exception:
-                    pass
-                if "state_summary" in allowed and parts:
-                    kv.append({"key": "state_summary", "value": " | ".join(parts)})
+                    if parts:
+                        kv.append({"key": "state_summary", "value": " | ".join(parts)})
 
+                # Booleans for convenience
                 mowing = None
                 try:
-                    from pymammotion.utility.constant import WorkMode as _WM3
-                    if sys_status is not None:
-                        mowing = int(sys_status) == int(_WM3.MODE_WORKING)
+                    from pymammotion.utility.constant import WorkMode as _WM
+                    if mode_int is not None:
+                        mowing = (mode_int == int(_WM.MODE_WORKING))
                 except Exception:
-                    mowing = bool(getattr(mower_state, "blade_status", False))
+                    mowing = bool(blades_on_val)
                 if mowing is not None and "onOffState" in allowed:
                     kv.append({"key": "onOffState", "value": bool(mowing)})
                 if mowing is not None and "mowing" in allowed:
@@ -1603,19 +1601,19 @@ class Plugin(indigo.PluginBase):
                 if "docked" in allowed:
                     try:
                         from pymammotion.utility.constant import WorkMode as _WM2
-                        docked = bool(charging) and (sys_status is not None and int(sys_status) == int(_WM2.MODE_READY))
+                        # Consider 'ready' + charging as docked (heuristic)
+                        docked = bool(charging) and (mode_int is not None and mode_int == int(_WM2.MODE_READY))
                     except Exception:
                         docked = False
                     kv.append({"key": "docked", "value": docked})
             except Exception:
                 self.logger.exception("summary block failed")
 
-            # NEW: Combined, human-readable status line + remaining progress
+            # Combined, human-readable status (with explicit Returning handling)
             try:
-                # Determine if an error is present from existing states/alarms
+                # Error detection from existing states/alarms
                 error_msg = None
                 try:
-                    # Prefer existing error_text state if set
                     existing_err = dev.states.get("error_text", "")
                     if existing_err:
                         error_msg = str(existing_err)
@@ -1632,71 +1630,75 @@ class Plugin(indigo.PluginBase):
                 except Exception:
                     pass
 
-                # Remaining percentage if we got progress
                 remaining_pct = None
                 if isinstance(progress_pct, int):
                     remaining_pct = max(0, 100 - progress_pct)
                     if "progress_remaining" in allowed:
                         kv.append({"key": "progress_remaining", "value": int(remaining_pct)})
 
-                # Compose combined line
+                # Booleans for logic
+                mowing_val = None
+                try:
+                    mowing_val = next((d["value"] for d in kv if d["key"] == "mowing"), mowing)
+                except Exception:
+                    mowing_val = mowing
+                docked_val = None
+                try:
+                    docked_val = next((d["value"] for d in kv if d["key"] == "docked"), False)
+                except Exception:
+                    docked_val = False
+                charging_val = charging
+
+                # Area label
+                area_label = area_name_val
+                if not area_label:
+                    try:
+                        zh = next((d["value"] for d in kv if d["key"] == "zone_hash"), None)
+                        if zh not in (None, 0):
+                            area_label = f"area {int(zh)}"
+                    except Exception:
+                        pass
+
+                # Battery text
+                batt_text = f"{batt_pct}%" if batt_pct is not None else "--"
+
+                # Explicit Returning handling
+                is_returning = False
+                try:
+                    from pymammotion.utility.constant import WorkMode as _WMX
+                    if mode_int is not None:
+                        is_returning = (mode_int == int(_WMX.MODE_RETURNING))
+                except Exception:
+                    # Fallback textual match
+                    is_returning = isinstance(mode_name, str) and ("Returning" in mode_name or "Return" in mode_name)
+
                 combined = None
                 if error_msg:
                     combined = f"Error: {error_msg}"
-                else:
-                    # Resolve mowing/docked/charging booleans from kv and locals
-                    mowing_val = None
-                    try:
-                        mowing_val = next((d["value"] for d in kv if d["key"] == "mowing"), mowing)
-                    except Exception:
-                        mowing_val = mowing
-                    docked_val = None
-                    try:
-                        docked_val = next((d["value"] for d in kv if d["key"] == "docked"), False)
-                    except Exception:
-                        docked_val = False
-                    charging_val = charging
-
-                    # Area label (fallback to zone hash if no friendly name)
-                    area_label = area_name_val
+                elif is_returning:
+                    combined = f"Returning to Dock (battery {batt_text})"
+                elif mowing_val:
+                    rem_text = f"{remaining_pct}%" if remaining_pct is not None else "--"
                     if not area_label:
-                        try:
-                            zh = next((d["value"] for d in kv if d["key"] == "zone_hash"), None)
-                            if zh not in (None, 0):
-                                area_label = f"area {int(zh)}"
-                        except Exception:
-                            pass
-
-                    # Battery text
-                    batt_text = f"{batt_pct}%" if batt_pct is not None else "--"
-
-                    if mowing_val:
-                        rem_text = f"{remaining_pct}%" if remaining_pct is not None else "--"
-                        if not area_label:
-                            area_label = "area"
-                        combined = f"Mowing {area_label}, remaining {rem_text}, battery {batt_text}"
-                    elif docked_val and bool(charging_val):
-                        combined = f"Docked and Charging (battery {batt_text})"
-                    elif docked_val and not bool(charging_val):
-                        combined = f"Docked, Not Charging (battery {batt_text})"
+                        area_label = "area"
+                    combined = f"Mowing {area_label}, remaining {rem_text}, battery {batt_text}"
+                elif docked_val and bool(charging_val):
+                    combined = f"Docked and Charging (battery {batt_text})"
+                elif docked_val and not bool(charging_val):
+                    combined = f"Docked, Not Charging (battery {batt_text})"
+                else:
+                    # Idle if not mowing and not docked
+                    if bool(charging_val):
+                        combined = f"Charging (battery {batt_text})"
                     else:
-                        # Idle if not mowing and not docked
-                        if bool(charging_val):
-                            combined = f"Charging (battery {batt_text})"
-                        else:
-                            combined = f"Idle, Not Charging (battery {batt_text})"
+                        combined = f"Idle, Not Charging (battery {batt_text})"
 
                 if combined and "status_combined" in allowed:
                     kv.append({"key": "status_combined", "value": combined})
             except Exception:
                 self.logger.exception("combined status build failed")
 
-            # Log keys and write
-            try:
-                self.logger.debug("kv keys to write (pre-filter): " + ", ".join([d["key"] for d in kv]))
-            except Exception:
-                pass
-
+            # Push updates
             try:
                 kv_safe = [d for d in kv if d.get("key") in allowed]
                 if len(kv_safe) != len(kv):
@@ -1710,6 +1712,9 @@ class Plugin(indigo.PluginBase):
         except Exception:
             self._set_status(dev_id, "Poll error")
             self.logger.exception("_refresh_states top-level failure")
+
+
+
     # _send_command stripped (movement verbs no sync/map; add sys_status logging)
     async def _send_command(self, dev_id: int, key: str, **kwargs):
         dev = indigo.devices.get(dev_id)
