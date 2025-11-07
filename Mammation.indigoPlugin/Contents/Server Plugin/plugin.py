@@ -1219,12 +1219,12 @@ class Plugin(indigo.PluginBase):
 
     async def _refresh_states(self, dev_id: int):
         """
-        Update Indigo states using HA-like data paths, with state IDs matching your Devices.xml:
-          - area_name, zone_hash
-          - progress_percent, blade_height_mm
-          - gps_lat, gps_lon
-          - wifi_rssi
-          - and existing pose/device states you already defined
+        Update Indigo states (human-readable) and add a combined status line, e.g.:
+          - "Mowing <area>, remaining <n>%, battery <b>%"
+          - "Docked and Charging"
+          - "Docked, Not Charging"
+          - "Idle, Not Charging"
+          - "Error: <message>"
         """
         dev = indigo.devices.get(dev_id)
         if not dev:
@@ -1254,7 +1254,7 @@ class Plugin(indigo.PluginBase):
             location = getattr(mowing_device, "location", None)
             map_obj = getattr(mowing_device, "map", None)
 
-            # Presence/log snapshot
+            # Presence/log snapshot (safe stats)
             try:
                 names_cnt = len(getattr(map_obj, "area_name", []) or [])
             except Exception:
@@ -1273,29 +1273,6 @@ class Plugin(indigo.PluginBase):
                 f"location={bool(location)} work_zone={wz} map.names={names_cnt} map.areas={areas_cnt}"
             )
 
-            # Dump raw-ish sections (best-effort) so we can see content on failures
-            def _as_dump(o):
-                try:
-                    if o is None:
-                        return None
-                    if hasattr(o, "to_dict"):
-                        return o.to_dict()
-                    if hasattr(o, "__dict__"):
-                        return {k: v for k, v in vars(o).items() if not k.startswith("_")}
-                    return str(o)
-                except Exception:
-                    return str(o)
-
-            try:
-                self.logger.debug(f"dump.dev={_as_dump(dev_status)}")
-                self.logger.debug(f"dump.work={_as_dump(work)}")
-                self.logger.debug(f"dump.connect={_as_dump(connect)}")
-                self.logger.debug(f"dump.rtk={_as_dump(rtk)}")
-                self.logger.debug(f"dump.local={_as_dump(local_status)}")
-                self.logger.debug(f"dump.location={_as_dump(location)}")
-            except Exception:
-                self.logger.exception("dump sections failed")
-
             # Connected flag
             try:
                 self._set_connected(dev_id, bool(getattr(mowing_device, "online", True)))
@@ -1303,52 +1280,48 @@ class Plugin(indigo.PluginBase):
                 self._set_connected(dev_id, True)
 
             allowed = set(dev.states.keys())
-            try:
-                self.logger.debug(
-                    f"_refresh_states: Indigo states available ({len(allowed)}): "
-                    + ", ".join(sorted(allowed))
-                )
-            except Exception:
-                pass
 
             kv = []
             from datetime import datetime as _dt
             kv.append({"key": "last_update", "value": _dt.now().strftime("%Y-%m-%d %H:%M:%S")})
             kv.append({"key": "status_text", "value": "OK"})
 
-            # Work mode / raw status
+            # Work mode / raw
             sys_status = getattr(dev_status, "sys_status", None)
             mode_name = ""
             try:
                 if sys_status is not None:
-                    # HA-style mapping
                     from pymammotion.utility.constant.device_constant import device_mode as _device_mode
                     mode_name = str(_device_mode(int(sys_status)))
             except Exception:
-                # Fallback to enum name if available
                 try:
                     from pymammotion.utility.constant import WorkMode
                     if sys_status is not None:
                         mode_name = WorkMode(int(sys_status)).name.replace("_", " ").title()
                 except Exception:
-                    # Last resort
                     mode_name = f"Status {sys_status}" if sys_status is not None else ""
 
-            # then write to your existing state
             if "work_mode" in allowed and mode_name:
                 kv.append({"key": "work_mode", "value": mode_name})
             if "state_raw" in allowed and sys_status is not None:
                 kv.append({"key": "state_raw", "value": str(sys_status)})
 
             # Battery / charge
+            batt_pct = None
             try:
                 batt = getattr(dev_status, "battery_val", None)
+                if batt is not None:
+                    batt_pct = int(batt)
                 if "battery_percent" in allowed and batt is not None:
                     kv.append({"key": "battery_percent", "value": int(batt)})
             except Exception:
                 self.logger.exception("battery_percent failed")
+
+            charging = None
             try:
                 ch_state = getattr(dev_status, "charge_state", None)
+                if ch_state is not None:
+                    charging = bool(int(ch_state) != 0)
                 if "charging" in allowed and ch_state is not None:
                     kv.append({"key": "charging", "value": bool(int(ch_state) != 0)})
             except Exception:
@@ -1369,26 +1342,27 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 self.logger.exception("mower_state block failed")
 
-            # Connectivity RSSI (your list showed wifi_rssi)
+            # RSSI
             try:
                 if connect is not None and "wifi_rssi" in allowed and getattr(connect, "wifi_rssi", None) is not None:
                     kv.append({"key": "wifi_rssi", "value": int(connect.wifi_rssi)})
             except Exception:
                 self.logger.exception("connect RSSI failed")
 
-            # Work: progress_percent + blade_height_mm
+            # Work progress and blade height
+            progress_pct = None
             try:
                 if work is not None:
                     area_raw = getattr(work, "area", 0) or 0
-                    progress_pct = (area_raw >> 16) & 0xFFFF
+                    progress_pct = int((area_raw >> 16) & 0xFFFF)
                     if "progress_percent" in allowed:
-                        kv.append({"key": "progress_percent", "value": int(progress_pct)})
+                        kv.append({"key": "progress_percent", "value": progress_pct})
                     if "blade_height_mm" in allowed and getattr(work, "knife_height", None) is not None:
                         kv.append({"key": "blade_height_mm", "value": int(getattr(work, "knife_height", 0))})
             except Exception:
                 self.logger.exception("work block failed")
 
-            # RTK satellites and splits
+            # RTK snapshot
             try:
                 if rtk is not None:
                     if "satellites_total" in allowed and getattr(rtk, "gps_stars", None) is not None:
@@ -1400,28 +1374,17 @@ class Plugin(indigo.PluginBase):
                                 kv.append({"key": "satellites_l2", "value": l2})
                         except Exception:
                             self.logger.exception("satellite split failed")
-                    # rtk_age state is in your list
                     if "rtk_age" in allowed and getattr(rtk, "age", None) is not None:
                         kv.append({"key": "rtk_age", "value": int(getattr(rtk, "age", 0))})
             except Exception:
                 self.logger.exception("rtk block failed")
 
-            # --- Position numbers with robust fallbacks (no .ui for pos_x/pos_y) ---
+            # Position source selection (local/vision/work)
             try:
-                # Prefer report_data.local if present
                 src = local_status if local_status is not None else None
-
-                pos_x_val = None
-                pos_y_val = None
-                lat_std_val = None
-                lon_std_val = None
-                pos_type_val = None
-                pos_level_val = None
-                toward_val = None
+                pos_x_val = pos_y_val = lat_std_val = lon_std_val = pos_type_val = pos_level_val = toward_val = None
                 pos_src = "none"
-
                 if src is not None:
-                    # Native local pose
                     def _num(val):
                         return None if val is None else float(val)
 
@@ -1434,7 +1397,6 @@ class Plugin(indigo.PluginBase):
                     toward_val = getattr(src, "toward", None)
                     pos_src = "local"
                 else:
-                    # Fallback 1: vision_info (meters + heading deg)
                     if vision_info is not None:
                         try:
                             vx = getattr(vision_info, "x", None)
@@ -1448,8 +1410,6 @@ class Plugin(indigo.PluginBase):
                                 toward_val = int(round(float(vh)))
                         except Exception:
                             self.logger.exception("vision_info fallback parse failed")
-
-                    # Fallback 2: work.path_pos_* (assume mm -> m) if vision unavailable
                     if pos_x_val is None and work is not None:
                         try:
                             wpx = getattr(work, "path_pos_x", None)
@@ -1460,8 +1420,6 @@ class Plugin(indigo.PluginBase):
                                 pos_src = "work.path_pos"
                         except Exception:
                             self.logger.exception("work.path_pos fallback parse failed")
-
-                    # Meta fallbacks
                     if pos_type_val is None and location is not None:
                         try:
                             pos_type_val = getattr(location, "position_type", None)
@@ -1475,13 +1433,10 @@ class Plugin(indigo.PluginBase):
 
                 self.logger.debug(f"_refresh_states: position source used = {pos_src}")
 
-                # Write pos_x / pos_y (numbers only, no '.ui' states since they don't exist on your device)
                 if pos_x_val is not None and "pos_x" in allowed:
                     kv.append({"key": "pos_x", "value": pos_x_val})
                 if pos_y_val is not None and "pos_y" in allowed:
                     kv.append({"key": "pos_y", "value": pos_y_val})
-
-                # lat/lon std devs (write only if present)
                 if lat_std_val is not None and "lat_std" in allowed:
                     kv.append({"key": "lat_std", "value": lat_std_val})
                     if "lat_std.ui" in allowed:
@@ -1490,8 +1445,6 @@ class Plugin(indigo.PluginBase):
                     kv.append({"key": "lon_std", "value": lon_std_val})
                     if "lon_std.ui" in allowed:
                         kv.append({"key": "lon_std.ui", "value": f"{lon_std_val:.3f}"})
-
-                # pos_type / pos_level / toward
                 if pos_type_val is not None and "pos_type" in allowed:
                     kv.append({"key": "pos_type", "value": int(pos_type_val)})
                 if pos_level_val is not None and "pos_level" in allowed:
@@ -1501,7 +1454,7 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 self.logger.exception("position block failed")
 
-            # --- GPS lat/lon: prefer RTK; fallback to device coords if RTK is zero ---
+            # GPS lat/lon preference RTK -> device
             try:
                 import math
                 rtk_lat_r = getattr(getattr(location, "RTK", None), "latitude", None) if location else None
@@ -1517,7 +1470,6 @@ class Plugin(indigo.PluginBase):
 
                 lat_deg = _rad_to_deg(rtk_lat_r) if rtk_lat_r not in (None, 0.0) else None
                 lon_deg = _rad_to_deg(rtk_lon_r) if rtk_lon_r not in (None, 0.0) else None
-
                 if lat_deg is None:
                     lat_deg = _rad_to_deg(dev_lat_r) if dev_lat_r is not None else None
                 if lon_deg is None:
@@ -1530,18 +1482,8 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 self.logger.exception("gps lat/lon fallback failed")
 
-            # --- Deduplicate keys before sending (avoids gps_lat/gps_lon duplicates) ---
-            try:
-                dedup = {}
-                for d in kv:
-                    k = d.get("key")
-                    if k:
-                        dedup[k] = d  # keep last occurrence
-                kv = list(dedup.values())
-            except Exception:
-                self.logger.exception("kv dedup failed")
-
-            # GPS (location RTK) + area_name/zone_hash (this uses your expected keys)
+            # zone_hash + area_name
+            area_name_val = None
             try:
                 import math
                 if location is not None:
@@ -1555,7 +1497,6 @@ class Plugin(indigo.PluginBase):
                     except Exception:
                         self.logger.exception("gps lat/lon failed")
 
-                    # zone_hash + area_name resolution (match your state IDs)
                     try:
                         hz = getattr(location, "work_zone", None)
                         if hz is not None:
@@ -1564,7 +1505,7 @@ class Plugin(indigo.PluginBase):
                                 kv.append({"key": "zone_hash", "value": hz_int})
                             if "area_name" in allowed:
                                 if hz_int == 0:
-                                    kv.append({"key": "area_name", "value": "Not working"})
+                                    area_name_val = "Not working"
                                 else:
                                     nm = None
                                     names = getattr(map_obj, "area_name", []) if map_obj else []
@@ -1588,14 +1529,14 @@ class Plugin(indigo.PluginBase):
                                             f"_refresh_states: could not resolve area name for hash={hz_int}; "
                                             f"area_name_count={names_cnt}, area_count={areas_cnt}"
                                         )
-                                    # IMPORTANT: write exactly to area_name
-                                    kv.append({"key": "area_name", "value": str(nm)})
+                                    area_name_val = str(nm)
+                                    kv.append({"key": "area_name", "value": area_name_val})
                     except Exception:
                         self.logger.exception("work area resolution failed")
             except Exception:
                 self.logger.exception("location block failed")
 
-            # Human summary + toggles
+            # Existing summary bits (not the combined line)
             try:
                 parts = []
                 if mode_name:
@@ -1603,7 +1544,7 @@ class Plugin(indigo.PluginBase):
                 if bool(getattr(mower_state, "blade_status", False)):
                     parts.append("Blades On")
                 try:
-                    if int(getattr(dev_status, "charge_state", 0)) != 0:
+                    if charging:
                         parts.append("Charging")
                 except Exception:
                     pass
@@ -1621,27 +1562,105 @@ class Plugin(indigo.PluginBase):
                     kv.append({"key": "onOffState", "value": bool(mowing)})
                 if mowing is not None and "mowing" in allowed:
                     kv.append({"key": "mowing", "value": bool(mowing)})
+
+                docked = False
                 if "docked" in allowed:
                     try:
                         from pymammotion.utility.constant import WorkMode as _WM2
-                        docked = bool(
-                            any(k["key"] == "charging" and k["value"] for k in kv)
-                            and sys_status is not None
-                            and int(sys_status) == int(_WM2.MODE_READY)
-                        )
+                        docked = bool(charging) and (sys_status is not None and int(sys_status) == int(_WM2.MODE_READY))
                     except Exception:
                         docked = False
                     kv.append({"key": "docked", "value": docked})
             except Exception:
                 self.logger.exception("summary block failed")
 
-            # Log the keys we’re about to write
+            # NEW: Combined, human-readable status line + remaining progress
+            try:
+                # Determine if an error is present from existing states/alarms
+                error_msg = None
+                try:
+                    # Prefer existing error_text state if set
+                    existing_err = dev.states.get("error_text", "")
+                    if existing_err:
+                        error_msg = str(existing_err)
+                except Exception:
+                    pass
+                try:
+                    tilt = bool(getattr(mower_state, "tilt_alarm", False))
+                    lift = bool(getattr(mower_state, "lift_alarm", False))
+                    if error_msg is None and (tilt or lift):
+                        bits = []
+                        if tilt: bits.append("Tilt alarm")
+                        if lift: bits.append("Lift alarm")
+                        error_msg = ", ".join(bits)
+                except Exception:
+                    pass
+
+                # Remaining percentage if we got progress
+                remaining_pct = None
+                if isinstance(progress_pct, int):
+                    remaining_pct = max(0, 100 - progress_pct)
+                    if "progress_remaining" in allowed:
+                        kv.append({"key": "progress_remaining", "value": int(remaining_pct)})
+
+                # Compose combined line
+                combined = None
+                if error_msg:
+                    combined = f"Error: {error_msg}"
+                else:
+                    # Resolve mowing/docked/charging booleans from kv and locals
+                    mowing_val = None
+                    try:
+                        mowing_val = next((d["value"] for d in kv if d["key"] == "mowing"), mowing)
+                    except Exception:
+                        mowing_val = mowing
+                    docked_val = None
+                    try:
+                        docked_val = next((d["value"] for d in kv if d["key"] == "docked"), False)
+                    except Exception:
+                        docked_val = False
+                    charging_val = charging
+
+                    # Area label (fallback to zone hash if no friendly name)
+                    area_label = area_name_val
+                    if not area_label:
+                        try:
+                            zh = next((d["value"] for d in kv if d["key"] == "zone_hash"), None)
+                            if zh not in (None, 0):
+                                area_label = f"area {int(zh)}"
+                        except Exception:
+                            pass
+
+                    # Battery text
+                    batt_text = f"{batt_pct}%" if batt_pct is not None else "--"
+
+                    if mowing_val:
+                        rem_text = f"{remaining_pct}%" if remaining_pct is not None else "--"
+                        if not area_label:
+                            area_label = "area"
+                        combined = f"Mowing {area_label}, remaining {rem_text}, battery {batt_text}"
+                    elif docked_val and bool(charging_val):
+                        combined = f"Docked and Charging (battery {batt_text})"
+                    elif docked_val and not bool(charging_val):
+                        combined = f"Docked, Not Charging (battery {batt_text})"
+                    else:
+                        # Idle if not mowing and not docked
+                        if bool(charging_val):
+                            combined = f"Charging (battery {batt_text})"
+                        else:
+                            combined = f"Idle, Not Charging (battery {batt_text})"
+
+                if combined and "status_combined" in allowed:
+                    kv.append({"key": "status_combined", "value": combined})
+            except Exception:
+                self.logger.exception("combined status build failed")
+
+            # Log keys and write
             try:
                 self.logger.debug("kv keys to write (pre-filter): " + ", ".join([d["key"] for d in kv]))
             except Exception:
                 pass
 
-            # Only write keys your device actually has; log skipped ones
             try:
                 kv_safe = [d for d in kv if d.get("key") in allowed]
                 if len(kv_safe) != len(kv):
@@ -1655,7 +1674,6 @@ class Plugin(indigo.PluginBase):
         except Exception:
             self._set_status(dev_id, "Poll error")
             self.logger.exception("_refresh_states top-level failure")
-
     # _send_command stripped (movement verbs no sync/map; add sys_status logging)
     async def _send_command(self, dev_id: int, key: str, **kwargs):
         dev = indigo.devices.get(dev_id)

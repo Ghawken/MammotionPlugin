@@ -20,6 +20,18 @@
         </ConfigUI>
 
         <States>
+                <State id="status_combined">
+        <ValueType>String</ValueType>
+        <TriggerLabel>Combined Status</TriggerLabel>
+        <ControlPageLabel>Status (combined)</ControlPageLabel>
+    </State>
+
+    <!-- Optional: remaining percentage based on progress (100 - progress_percent) -->
+    <State id="progress_remaining">
+        <ValueType>Integer</ValueType>
+        <TriggerLabel>Remaining (%)</TriggerLabel>
+        <ControlPageLabel>Remaining (%)</ControlPageLabel>
+    </State>
             <!-- Connection/auth -->
             <State id="connected"><ValueType>Boolean</ValueType><TriggerLabel>Connected</TriggerLabel><ControlPageLabel>Connected</ControlPageLabel></State>
             <State id="auth_ok"><ValueType>Boolean</ValueType><TriggerLabel>Authenticated</TriggerLabel><ControlPageLabel>Authenticated</ControlPageLabel></State>
@@ -80,6 +92,6 @@
             <State id="onOffState"><ValueType>Boolean</ValueType><TriggerLabel>On/Off</TriggerLabel><ControlPageLabel>On/Off</ControlPageLabel></State>
         </States>
 
-        <UiDisplayStateId>state_summary</UiDisplayStateId>
+        <UiDisplayStateId>status_combined</UiDisplayStateId>
     </Device>
 </Devices>
