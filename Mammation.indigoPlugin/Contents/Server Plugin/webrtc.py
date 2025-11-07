@@ -251,21 +251,73 @@ def start_webrtc_http(plugin):
                 # Implement a stop-all movement command here if your API requires it.
                 return web.json_response({"ok": True})
 
-            async def dock_now(request):
+            def _pick_dev():
+                """
+                Choose the active Indigo Mammotion device:
+                - Prefer the device currently used for streaming (plugin._webrtc_active_dev_id)
+                - Otherwise the first enabled+configured device owned by this plugin.
+                Returns an indigo.Device or None.
+                """
                 try:
-                    from aiohttp import web
-                except Exception:
-                    pass
-                # _pick_dev must already exist in this module (as in earlier versions)
-                dev = _pick_dev()
+                    # Prefer active streaming device
+                    active_id = getattr(plugin, "_webrtc_active_dev_id", None)
+                    if active_id:
+                        try:
+                            d = indigo.devices.get(active_id)
+                            if d and d.enabled and d.configured:
+                                return d
+                        except Exception:
+                            pass
+
+                    # Fallback: first enabled/configured plugin device
+                    for d in indigo.devices.iter("self"):
+                        if d.enabled and d.configured:
+                            return d
+                except Exception as ex:
+                    try:
+                        plugin.logger.debug(f"_pick_dev error: {ex}")
+                    except Exception:
+                        pass
+                return None
+            # Replace your existing dock handler with this one (keep it near other handlers)
+            async def dock_now(request):
+                from aiohttp import web
+                import asyncio
+
+                try:
+                    dev = _pick_dev()
+                except Exception as ex:
+                    # _pick_dev not available or failed – always return JSON
+                    try:
+                        plugin.logger.error(f"Dock: _pick_dev error: {ex}")
+                    except Exception:
+                        pass
+                    return web.json_response({"ok": False, "error": "internal: pick device failed"}, status=500)
+
                 if not dev:
                     return web.json_response({"ok": False, "error": "no active device"}, status=404)
+
                 try:
-                    # Use your existing command path (updates states on success)
+                    # Best-effort: pause or cancel any active task before dock (some firmwares require it)
+                    pre_cmd_errors = []
+                    for cmd in ("pause_execute_task", "cancel_job"):
+                        try:
+                            plugin.logger.debug(f"Dock: pre-step {cmd} for '{dev.name}'")
+                            await plugin._send_command(dev.id, cmd)
+                            await asyncio.sleep(0.25)
+                            break
+                        except Exception as ex:
+                            pre_cmd_errors.append(str(ex))
+
+                    # Send dock
+                    plugin.logger.info(f"Dock: return_to_dock for '{dev.name}'")
                     await plugin._send_command(dev.id, "return_to_dock")
+
+                    # Let normal (non-joystick) commands run sync/map state
                     return web.json_response({"ok": True})
                 except Exception as ex:
-                    plugin.logger.error(f"Dock command failed: {ex}")
+                    plugin.logger.error(f"Dock command failed for '{dev.name}': {ex}")
+                    # Always return JSON, never HTML, to keep the browser happy
                     return web.json_response({"ok": False, "error": str(ex)}, status=500)
 
             async def player(request):
@@ -378,21 +430,37 @@ def start_webrtc_http(plugin):
                 setTimeout(firstMoveCallback,150);
               };
             }
-            async function sendDock(){
-              try{
-                dockBtn.disabled=true;
-                setStatus('Sending dock command…');
-                const r=await fetch('/webrtc/dock',{method:'POST'});
-                const j=await r.json();
-                if(!j.ok) throw new Error(j.error||'dock failed');
-                setStatus('Docking requested.');
-              }catch(e){
-                setStatus('Dock error: '+e.message);
-              }finally{
-                // Re-enable after a short delay to prevent spamming
-                setTimeout(()=>{ dockBtn.disabled=false; }, 2000);
+          async function sendDock(){
+            try{
+              dockBtn.disabled = true;
+              setStatus('Sending dock command…');
+              const r = await fetch('/webrtc/dock', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: '{}'  // keep consistent JSON shape, even if server ignores body
+              });
+        
+              let ok = false, err = null;
+              const ct = r.headers.get('content-type') || '';
+              if (ct.includes('application/json')) {
+                const j = await r.json();
+                ok = j && j.ok === true;
+                err = j && j.error;
+              } else {
+                // Server returned HTML (e.g., framework 500 page) – surface a short excerpt
+                const txt = await r.text();
+                err = `HTTP ${r.status} ${r.statusText}${txt ? `: ${txt.substring(0,200)}` : ''}`;
               }
+        
+              if (!ok) throw new Error(err || `HTTP ${r.status}`);
+        
+              setStatus('Docking requested.');
+            } catch(e){
+              setStatus('Dock error: ' + (e && e.message ? e.message : String(e)));
+            } finally {
+              setTimeout(()=>{ dockBtn.disabled = false; }, 2000);
             }
+          }
 
             async function startAll(){
               if(client){setStatus('Already running');return;}
