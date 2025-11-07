@@ -18,10 +18,33 @@
         <Name>Start Mowing (Select Areas)</Name>
         <CallbackMethod>start_mowing_areas_action</CallbackMethod>
         <ConfigUI>
+            <!-- NEW: Blade height selector 30–100mm (default 65mm) -->
+            <Field id="bladeHeight" type="menu" defaultValue="65">
+                <Label>Blade height (mm):</Label>
+                <List>
+                    <Option value="30">30</Option>
+                    <Option value="35">35</Option>
+                    <Option value="40">40</Option>
+                    <Option value="45">45</Option>
+                    <Option value="50">50</Option>
+                    <Option value="55">55</Option>
+                    <Option value="60">60</Option>
+                    <Option value="65">65</Option>
+                    <Option value="70">70</Option>
+                    <Option value="75">75</Option>
+                    <Option value="80">80</Option>
+                    <Option value="85">85</Option>
+                    <Option value="90">90</Option>
+                    <Option value="95">95</Option>
+                    <Option value="100">100</Option>
+                </List>
+            </Field>
+
             <Field id="areas" type="list" selectionType="multiple">
                 <Label>Areas to mow:</Label>
                 <List class="self" method="areas_menu" dynamicReload="true"/>
             </Field>
+
             <Field id="areasNote" type="label" fontColor="darkgray" fontSize="small">
                 <Label>If empty, the mower may reuse its last plan. Open again if list says “Fetching…”</Label>
             </Field>

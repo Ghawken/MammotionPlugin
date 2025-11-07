@@ -2050,14 +2050,32 @@ class Plugin(indigo.PluginBase):
     # Replace previous CSV variant with dynamic list aware action
     def start_mowing_areas_action(self, action, dev):
         """
-        Start mowing using exact HA flow: build a GenerateRouteInformation with one_hashs=selected areas,
-        send generate_route_information, then start_job.
-        No library probing or fallback names.
+        Start mowing selected areas with explicit blade height:
+          - areas: list of area hashes (from dynamic list)
+          - bladeHeight: menu 30–100mm (default 65mm)
+          - Build GenerateRouteInformation(one_hashs=..., blade_height=...)
+          - Then start_job and quick sync
         """
         import re, json
-        # Normalize 'areas' selection to list of ints (accept Indigo list or stringified form)
+
+        # --- Parse blade height from Action UI (default 65; clamp 30..100). Yuka/-mini will override to -10. ---
+        chosen_height = 65
+        try:
+            raw_h = (action.props.get("bladeHeight") or "").strip()
+            if raw_h:
+                hh = int(raw_h)
+                if hh < 30:
+                    hh = 30
+                if hh > 100:
+                    hh = 100
+                chosen_height = hh
+        except Exception:
+            chosen_height = 65
+
+        # --- Normalize areas selection to list[int] hashes ---
         raw = action.props.get("areas")
-        self.logger.debug(f"start_mowing_areas_action: raw areas={raw!r} (type={type(raw)})")
+        self.logger.debug(
+            f"start_mowing_areas_action: raw areas={raw!r} (type={type(raw)}), bladeHeight={chosen_height}mm")
         candidates = []
         if isinstance(raw, (list, tuple)):
             candidates = [str(x) for x in raw if str(x)]
@@ -2076,6 +2094,7 @@ class Plugin(indigo.PluginBase):
                 candidates = re.findall(r"\b\d{6,20}\b", s)
         else:
             candidates = re.findall(r"\b\d{6,20}\b", str(raw))
+
         hashes = []
         seen = set()
         for s in candidates:
@@ -2086,8 +2105,11 @@ class Plugin(indigo.PluginBase):
                     hashes.append(h)
             except Exception:
                 self.logger.warning(f"Ignoring invalid area hash '{s}' in selection for '{dev.name}'")
+
+        # If none, start last plan
         if not hashes:
-            self.logger.info(f"Start mowing requested for '{dev.name}' with no explicit areas (using last plan)")
+            self.logger.info(
+                f"Start mowing requested for '{dev.name}' with no explicit areas (using last plan); blade {chosen_height}mm")
 
             async def _fallback():
                 await self._send_command(dev.id, "start_job")
@@ -2095,7 +2117,7 @@ class Plugin(indigo.PluginBase):
 
             return self._schedule(dev.id, _fallback())
 
-        # Friendly name map (optional, best-effort)
+        # Friendly names (best-effort)
         mgr = self._mgr.get(dev.id)
         mower_name = self._mower_name.get(dev.id)
         mowing_device = mgr.mower(mower_name) if mgr and mower_name else None
@@ -2110,25 +2132,51 @@ class Plugin(indigo.PluginBase):
                         break
                 area_names[h] = nm or f"area {h}"
         pretty = ", ".join([f"{area_names.get(h, h)} ({h})" for h in hashes])
-        self.logger.info(f"Start mowing requested for '{dev.name}' with areas: {pretty}")
 
-        # Immediate UI hint
+        # Decide final blade height (Yuka override)
+        blade_height_to_use = chosen_height
+        try:
+            from pymammotion.utility.device_type import DeviceType
+            if mower_name and (DeviceType.is_yuka(mower_name) or DeviceType.is_yuka_mini(mower_name)):
+                blade_height_to_use = -10  # required by Yuka firmware
+        except Exception:
+            pass
+
+        self.logger.info(
+            f"Start mowing for '{dev.name}' with areas: {pretty} | blade height: "
+            f"{blade_height_to_use if blade_height_to_use >= 0 else 'Yuka auto (-10)'}"
+        )
+
+        # Immediate UI hint for area + blade height (non-negative)
         first = hashes[0]
         kv = []
         if "zone_hash" in dev.states:
             kv.append({"key": "zone_hash", "value": first})
         if "area_name" in dev.states:
             kv.append({"key": "area_name", "value": str(area_names.get(first, f'area {first}'))})
+        if blade_height_to_use >= 0 and "blade_height_mm" in dev.states:
+            kv.append({"key": "blade_height_mm", "value": int(blade_height_to_use)})
         if kv:
-            dev.updateStatesOnServer(kv)
+            try:
+                dev.updateStatesOnServer(kv)
+            except Exception:
+                pass
 
-        # Generate route then start_job (HA coordinator async_plan_route pattern)
+        # Generate route (include blade_height) then start job
         from pymammotion.data.model import GenerateRouteInformation
         async def _do():
+            try:
+                gri = GenerateRouteInformation(
+                    one_hashs=list(hashes),
+                    blade_height=int(blade_height_to_use),
+                )
+            except Exception:
+                gri = GenerateRouteInformation(one_hashs=list(hashes))
+
             await self._send_command(
                 dev.id,
                 "generate_route_information",
-                generate_route_information=GenerateRouteInformation(one_hashs=list(hashes))
+                generate_route_information=gri,
             )
             await self._send_command(dev.id, "start_job")
             await self._request_quick_sync(dev.id)
