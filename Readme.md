@@ -1,6 +1,7 @@
-# Mammotion Indigo Plugin
+#    Mammotion Indigo Plugin
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/><img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="20"/>
 
-<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Mammation.indigoPlugin/Resources/icon.png?raw=true" alt="Mammotion Icon" width="100%"/>
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Mammation.indigoPlugin/Resources/icon.png?raw=true" alt="Mammotion Icon" width="20%"/>
 
 Indigo Domo plugin for Mammotion mowers featuring:
 - Built‑in WebRTC (Agora) viewer served by the plugin
@@ -67,6 +68,9 @@ Notes
 
 ## Indigo Actions and Commands
 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+
+
 Movement (Action Group actions, each takes a speed float 0.1–1.0):
 - Move Forward — sends move_forward(linear=speed)
 - Move Back — sends move_back(linear=speed)
@@ -87,6 +91,9 @@ Tips
 - Movements are ignored by firmware in non‑interactive modes (docked/charging/locked).
 
 ## Device States (accessible in Indigo)
+
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+
 
 Connection and Stream
 - connected (bool)
@@ -142,6 +149,9 @@ Notes
 
 ## Security
 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+
+
 The viewer is served over plain HTTP for LAN use. If exposing externally, use an authenticated reverse proxy with TLS.
 
 ## Troubleshooting
@@ -160,3 +170,11 @@ The viewer is served over plain HTTP for LAN use. If exposing externally, use an
 ## License
 
 MIT (see LICENSE)
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
+<img src="https://raw.githubusercontent.com/Ghawken/MammotionPlugin/refs/heads/main/Images/icon_mowing_1.png?raw=true" width="50"/> 
