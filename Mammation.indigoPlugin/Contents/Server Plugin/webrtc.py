@@ -362,7 +362,7 @@ def start_webrtc_http(plugin):
                 <button id="stopBtn" disabled>Stop</button>
                  <button id="dockBtn">Dock</button>   <!-- NEW -->
                 <button id="switchCameraBtn">Switch</button>
-                <button id="fsBtn">Fullscreen</button>
+
                 <button id="joyToggle">Joystick</button>
                 <button id="reloadBtn">Reload</button>
                 <div id="speedWrap">
@@ -397,7 +397,7 @@ def start_webrtc_http(plugin):
             const playBtn=document.getElementById('playBtn');
             const stopBtn=document.getElementById('stopBtn');
             const switchBtn=document.getElementById('switchCameraBtn');
-            const fsBtn=document.getElementById('fsBtn');
+           // const fsBtn=document.getElementById('fsBtn');
             const reloadBtn=document.getElementById('reloadBtn');
             const joyToggle=document.getElementById('joyToggle');
             const joy=document.getElementById('joystick');
@@ -730,7 +730,7 @@ def start_webrtc_http(plugin):
             playBtn.addEventListener('click', startAll);
             stopBtn.addEventListener('click', stopAll);
             reloadBtn.addEventListener('click', ()=>location.reload());
-            fsBtn.addEventListener('click', toggleFullscreen);
+            //fsBtn.addEventListener('click', toggleFullscreen);
             joyToggle.addEventListener('click', toggleJoystick);
 
             // Auto-show joystick if ?joystick=1
