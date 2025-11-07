@@ -56,18 +56,30 @@ def start_webrtc_http(plugin):
 
                 async def _do():
                     try:
-                        device = mgr.get_device_by_name(mower_name)
-                        # Call your internal movement helpers if present, otherwise just log
-                        if direction == "up" and hasattr(plugin, "_movement_forward"):
-                            await plugin._movement_forward(device, speed, continuous)
-                        elif direction == "down" and hasattr(plugin, "_movement_back"):
-                            await plugin._movement_back(device, speed, continuous)
-                        elif direction == "left" and hasattr(plugin, "_movement_left"):
-                            await plugin._movement_left(device, speed, continuous)
-                        elif direction == "right" and hasattr(plugin, "_movement_right"):
-                            await plugin._movement_right(device, speed, continuous)
+                        # Use the Indigo device for action handlers (NOT the Mammotion manager/wrapper)
+                        indigo_dev = indigo.devices.get(dev_id)
+                        if not indigo_dev:
+                            plugin.logger.error(f"Move: Indigo device id {dev_id} not found")
+                            return
+
+                        # Build an Indigo-like action with props['speed'] as a string (as your actions expect)
+                        try:
+                            spd = float(speed)
+                        except Exception:
+                            spd = 0.0
+                        from types import SimpleNamespace
+                        action = SimpleNamespace(props={"speed": f"{spd}"})
+
+                        if direction == "up" and hasattr(plugin, "move_forward_action"):
+                            plugin.move_forward_action(action, indigo_dev)
+                        elif direction == "down" and hasattr(plugin, "move_back_action"):
+                            plugin.move_back_action(action, indigo_dev)
+                        elif direction == "left" and hasattr(plugin, "move_left_action"):
+                            plugin.move_left_action(action, indigo_dev)
+                        elif direction == "right" and hasattr(plugin, "move_right_action"):
+                            plugin.move_right_action(action, indigo_dev)
                         else:
-                            plugin.logger.debug(f"Move stub: {direction} @ {speed} (continuous={continuous})")
+                            plugin.logger.debug(f"Move stub: {direction} @ {spd} (continuous={continuous})")
                     except Exception as ex:
                         plugin.logger.error(f"Move command failed: {ex}")
 
@@ -239,6 +251,23 @@ def start_webrtc_http(plugin):
                 # Implement a stop-all movement command here if your API requires it.
                 return web.json_response({"ok": True})
 
+            async def dock_now(request):
+                try:
+                    from aiohttp import web
+                except Exception:
+                    pass
+                # _pick_dev must already exist in this module (as in earlier versions)
+                dev = _pick_dev()
+                if not dev:
+                    return web.json_response({"ok": False, "error": "no active device"}, status=404)
+                try:
+                    # Use your existing command path (updates states on success)
+                    await plugin._send_command(dev.id, "return_to_dock")
+                    return web.json_response({"ok": True})
+                except Exception as ex:
+                    plugin.logger.error(f"Dock command failed: {ex}")
+                    return web.json_response({"ok": False, "error": str(ex)}, status=500)
+
             async def player(request):
                     html = '''<!doctype html>
             <html>
@@ -279,6 +308,7 @@ def start_webrtc_http(plugin):
               <div id="topbar">
                 <button id="playBtn">Play</button>
                 <button id="stopBtn" disabled>Stop</button>
+                 <button id="dockBtn">Dock</button>   <!-- NEW -->
                 <button id="switchCameraBtn">Switch</button>
                 <button id="fsBtn">Fullscreen</button>
                 <button id="joyToggle">Joystick</button>
@@ -310,7 +340,7 @@ def start_webrtc_http(plugin):
             let currentIndex=0;          // Index of current displayed user
             let preferredUid=localStorage.getItem('preferredMammotionCameraUid');
             let movementSpeed=parseFloat(localStorage.getItem('preferredJoystickSpeed')||'0.4');
-
+            const dockBtn=document.getElementById('dockBtn');   // NEW
             const statusEl=document.getElementById('status');
             const playBtn=document.getElementById('playBtn');
             const stopBtn=document.getElementById('stopBtn');
@@ -347,6 +377,21 @@ def start_webrtc_http(plugin):
                 localStorage.setItem('mammotionDisclaimerAccepted','yes');
                 setTimeout(firstMoveCallback,150);
               };
+            }
+            async function sendDock(){
+              try{
+                dockBtn.disabled=true;
+                setStatus('Sending dock command…');
+                const r=await fetch('/webrtc/dock',{method:'POST'});
+                const j=await r.json();
+                if(!j.ok) throw new Error(j.error||'dock failed');
+                setStatus('Docking requested.');
+              }catch(e){
+                setStatus('Dock error: '+e.message);
+              }finally{
+                // Re-enable after a short delay to prevent spamming
+                setTimeout(()=>{ dockBtn.disabled=false; }, 2000);
+              }
             }
 
             async function startAll(){
@@ -432,7 +477,8 @@ def start_webrtc_http(plugin):
               showCurrentVideo();
               setStatus('Switched to camera UID='+user.uid);
             });
-
+            dockBtn.addEventListener('click', sendDock);  // NEW
+            
             async function joinAgora(t){
               if(!window.AgoraRTC) throw new Error('SDK missing');
               if(AgoraRTC.setLogLevel) AgoraRTC.setLogLevel(4);
@@ -652,6 +698,7 @@ def start_webrtc_http(plugin):
             app.router.add_post("/webrtc/move", move_once)
             app.router.add_post("/webrtc/move_hold", move_hold)
             app.router.add_post("/webrtc/move_release", move_release)
+            app.router.add_post("/webrtc/dock", dock_now)  # NEW
 
             runner = web.AppRunner(app)
             await runner.setup()

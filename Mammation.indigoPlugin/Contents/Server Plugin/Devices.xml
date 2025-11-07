@@ -13,6 +13,10 @@
                 <Label>Mower Name (optional):</Label>
                 <Description>Optional: exact mower name to control (as shown in Mammotion app). Leave blank to use the first mower on the account.</Description>
             </Field>
+
+            <Field id="note2" type="label" fontColor="blue" fontSize="normal">
+    <Label>Luba only allows one connection, ideally set up a new account email and share access with Robot for Dual Control</Label>
+</Field>
         </ConfigUI>
 
         <States>

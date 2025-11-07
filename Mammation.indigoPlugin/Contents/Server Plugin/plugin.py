@@ -227,6 +227,24 @@ class Plugin(indigo.PluginBase):
             return [("err", "Error building list")]
 
     # New: async fetch of areas from the library (best-effort across library versions)
+    async def ensure_manual_mode(self, dev_id):
+        indigo_dev = indigo.devices.get(dev_id)
+        mgr = self._mgr.get(dev_id)
+        mower_name = self._mower_name.get(dev_id)
+        if not (mgr and mower_name):
+            return
+        device = mgr.get_device_by_name(mower_name)
+        account_id = self._user_account_id.get(dev_id)
+        if not (device and account_id):
+            return
+        from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
+        try:
+            cmd = MammotionCommand(mower_name, int(account_id)).device_remote_control_with_position(enter_state=1)
+            await device.cloud_client.send_cloud_command(device.iot_id, cmd)
+            self.logger.info("Entered remote manual control mode")
+        except Exception as ex:
+            self.logger.error(f"Enter manual control failed: {ex}")
+
     async def _fetch_areas(self, dev_id: int):
         """
         Fetch areas from the connected manager. Normalize to [{'id': <str>, 'name': <str>}].
@@ -1638,11 +1656,8 @@ class Plugin(indigo.PluginBase):
             self._set_status(dev_id, "Poll error")
             self.logger.exception("_refresh_states top-level failure")
 
-
+    # _send_command stripped (movement verbs no sync/map; add sys_status logging)
     async def _send_command(self, dev_id: int, key: str, **kwargs):
-        """
-        Send a mower command via the connected Mammotion manager.
-        """
         dev = indigo.devices.get(dev_id)
         if not dev:
             return
@@ -1651,27 +1666,23 @@ class Plugin(indigo.PluginBase):
         if not name or not mgr:
             self._set_status(dev_id, "No mower selected")
             return
+        nosync = {"move_forward", "move_back", "move_left", "move_right"}
         try:
+            device = mgr.get_device_by_name(name)
+            sys_status = getattr(getattr(device, "state", None), "report_data", None)
+            sys_status = getattr(getattr(sys_status, "dev", None), "sys_status", None)
+            self.logger.debug(f"_send_command ctx key={key} sys_status={sys_status} kwargs={kwargs}")
             if kwargs:
                 await mgr.send_command_with_args(name, key, **kwargs)
             else:
                 await mgr.send_command(name, key)
-
-            try:
-                await mgr.start_sync(name, retry=1)
-            except Exception:
-                pass
-
-            if key == "start_job":
-                dev.updateStateOnServer("onOffState", True)
-                dev.updateStateOnServer("mowing", True)
-            elif key in ("pause_execute_task", "cancel_job"):
-                dev.updateStateOnServer("mowing", False)
-            elif key == "return_to_dock":
-                dev.updateStateOnServer("onOffState", False)
-                dev.updateStateOnServer("mowing", False)
-                dev.updateStateOnServer("docked", True)
-
+            if key not in nosync:
+                try:
+                    await mgr.start_sync(name, retry=1)
+                except Exception:
+                    pass
+            else:
+                self.logger.debug(f"Skip sync for movement key={key}")
             self._set_status(dev_id, f"Command sent: {key}")
         except Exception as ex:
             self._set_status(dev_id, f"Command error: {ex}")
@@ -2179,15 +2190,35 @@ class Plugin(indigo.PluginBase):
         try:
             spd = float((action.props.get("speed") or "0").strip())
             self.logger.info(f"Move forward speed={spd} for '{dev.name}'")
-            self._schedule(dev.id, self._send_command(dev.id, "move_forward", speed=spd))
+
+            async def _run():
+                await self._send_command(dev.id, "move_forward", linear=spd)
+
+            self._schedule(dev.id, _run())
         except Exception:
             self.logger.exception("move_forward_action failed")
+
+    def move_back_action(self, action, dev):
+        try:
+            spd = float((action.props.get("speed") or "0").strip())
+            self.logger.info(f"Move back speed={spd} for '{dev.name}'")
+
+            async def _run():
+                await self._send_command(dev.id, "move_back", linear=spd)
+
+            self._schedule(dev.id, _run())
+        except Exception:
+            self.logger.exception("move_back_action failed")
 
     def move_left_action(self, action, dev):
         try:
             spd = float((action.props.get("speed") or "0").strip())
             self.logger.info(f"Move left speed={spd} for '{dev.name}'")
-            self._schedule(dev.id, self._send_command(dev.id, "move_left", speed=spd))
+
+            async def _run():
+                await self._send_command(dev.id, "move_left", angular=spd)
+
+            self._schedule(dev.id, _run())
         except Exception:
             self.logger.exception("move_left_action failed")
 
@@ -2195,17 +2226,13 @@ class Plugin(indigo.PluginBase):
         try:
             spd = float((action.props.get("speed") or "0").strip())
             self.logger.info(f"Move right speed={spd} for '{dev.name}'")
-            self._schedule(dev.id, self._send_command(dev.id, "move_right", speed=spd))
+
+            async def _run():
+                await self._send_command(dev.id, "move_right", angular=spd)
+
+            self._schedule(dev.id, _run())
         except Exception:
             self.logger.exception("move_right_action failed")
-
-    def move_back_action(self, action, dev):
-        try:
-            spd = float((action.props.get("speed") or "0").strip())
-            self.logger.info(f"Move back speed={spd} for '{dev.name}'")
-            self._schedule(dev.id, self._send_command(dev.id, "move_back", speed=spd))
-        except Exception:
-            self.logger.exception("move_back_action failed")
 
     def rtk_dock_location_action(self, action, dev):
         try:
