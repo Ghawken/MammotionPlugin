@@ -85,7 +85,7 @@ class Plugin(indigo.PluginBase):
         self._mgr = {}  # dev.id -> connected Mammotion manager (reuse)
         self._cloud_hooks = {}  # dev.id -> {'msg': callable, 'props': callable}
         self._area_names = {}  # dev_id -> {hash:int -> name:str}
-
+        self._last_forced_state_refresh = {}  # dev_id -> monotonic timestamp
         # In __init__ after your logger setup/runtime maps add:
         self._map_sync_started = {}  # dev_id -> bool (map sync already kicked off)
         self._last_area_req = {}  # dev_id -> monotonic timestamp of last get_area_name_list
@@ -689,6 +689,42 @@ class Plugin(indigo.PluginBase):
                         t.cancel()
                 break
 
+
+    def _force_refresh_states(self, dev_id: int, delay: float = 0.3, min_interval: float = 0.8):
+        """
+        Schedule a quick _refresh_states run after an optional delay.
+        min_interval prevents spamming (movement pulses).
+        """
+        now = time.monotonic()
+        last = self._last_forced_state_refresh.get(dev_id, 0.0)
+        if (now - last) < min_interval:
+            return
+        self._last_forced_state_refresh[dev_id] = now
+
+        loop = getattr(self, "_event_loop", None)
+        if not loop:
+            # Fallback: best-effort direct call
+            try:
+                if delay > 0:
+                    time.sleep(delay)
+                indigo.server.queueFuture(
+                    lambda: asyncio.run_coroutine_threadsafe(self._refresh_states(dev_id), asyncio.get_event_loop()))
+            except Exception:
+                pass
+            return
+
+        async def _do():
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self._refresh_states(dev_id)
+            except Exception:
+                self.logger.exception("force refresh failed")
+
+        try:
+            loop.call_soon_threadsafe(asyncio.create_task, _do())
+        except Exception:
+            self.logger.exception("schedule force refresh failed")
     ########################################
     def validateDeviceConfigUi(self, values_dict, type_id, dev_id):
         """
@@ -1702,6 +1738,25 @@ class Plugin(indigo.PluginBase):
             else:
                 self.logger.debug(f"Skip sync for movement key={key}")
             self._set_status(dev_id, f"Command sent: {key}")
+            refresh_after = {
+                "start_job": 0.6,
+                "cancel_job": 0.6,
+                "pause_execute_task": 0.6,
+                "return_to_dock": 0.8,
+                "move_forward": 0.3,
+                "move_back": 0.3,
+                "move_left": 0.3,
+                "move_right": 0.3,
+            }
+
+            try:
+                delay = refresh_after.get(key)
+                if delay is not None:
+                    self._force_refresh_states(dev_id, delay=delay, min_interval=(
+                        0.8 if key not in ("move_forward", "move_back", "move_left", "move_right") else 1.5))
+            except Exception:
+                pass
+
         except Exception as ex:
             self._set_status(dev_id, f"Command error: {ex}")
 
