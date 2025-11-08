@@ -99,6 +99,9 @@ class Plugin(indigo.PluginBase):
         self._webrtc_active_dev_id = None  # last device that refreshed tokens
         self._user_account_id = {}  # dev.id -> int userAccount for MammotionCommand
 
+        # In Plugin.__init__ (after super().__init__):
+        self._unknown_area_logged = {}  # dev_id -> set([hashes])
+        self._last_map_request = {}  # dev_id -> monotonic timestamp
 
         # Logging setup (pattern as in Device Timer / EVSEMaster)
         if hasattr(self, "indigo_log_handler") and self.indigo_log_handler:
@@ -995,7 +998,28 @@ class Plugin(indigo.PluginBase):
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
+##
 
+    # Helper (place inside Plugin class)
+    def _maybe_request_map(self, dev_id: int, min_interval: float = 30.0):
+        """
+        Best-effort gentle map refresh trigger – only if we haven't already
+        tried recently. Keep it minimal to avoid library churn.
+        """
+        import time
+        now = time.monotonic()
+        last = self._last_map_request.get(dev_id, 0.0)
+        if (now - last) < min_interval:
+            return
+        self._last_map_request[dev_id] = now
+        try:
+            # If you have a dedicated "start_map_sync" or similar command wrapper,
+            # call that. Otherwise send the underlying library command if exposed.
+            # Example (adjust to your existing send wrapper):
+            self.logger.debug(f"Requesting map sync for dev {dev_id}")
+            self._schedule(dev_id, self._send_command(dev_id, "start_map_sync"))
+        except Exception:
+            pass
     # ========== Match HA: plain get_report_cfg then request_iot_sys with enums ==========
     async def _prime_reporting(self, dev_id: int, mgr):
         name = self._mower_name.get(dev_id)
@@ -1560,14 +1584,25 @@ class Plugin(indigo.PluginBase):
                                                 if getattr(an, "hash", None) == getattr(frame0, "hash", None):
                                                     nm = getattr(an, "name", None) or f"area {hz_int}"
                                                     break
+                                # ... inside the zone_hash / area_name resolution block, replace the final else branch:
+
                                 if nm is None:
-                                    nm = f"area {hz_int}"
-                                    self.logger.debug(
-                                        f"_refresh_states: could not resolve area name for hash={hz_int}; "
-                                        f"area_name_count={names_cnt}, area_count={areas_cnt}"
-                                    )
+                                    # Fallback – suppress repetitive spam
+                                    dev_logged = self._unknown_area_logged.setdefault(dev_id, set())
+                                    if hz_int not in dev_logged:
+                                        self.logger.debug(
+                                            f"_refresh_states: first miss resolving area name hash={hz_int}; "
+                                            f"area_name_count={names_cnt}, area_count={areas_cnt}"
+                                        )
+                                        dev_logged.add(hz_int)
+                                        # Try (once per interval) to pull map names
+                                        self._maybe_request_map(dev_id)
+                                    # Provide a readable fallback (short form: last 6 digits)
+                                    short_tail = str(hz_int)[-6:]
+                                    nm = f"Area {short_tail}"
                                 area_name_val = str(nm)
                                 kv.append({"key": "area_name", "value": area_name_val})
+
             except Exception:
                 self.logger.exception("work area resolution failed")
 
@@ -2183,6 +2218,291 @@ class Plugin(indigo.PluginBase):
 
         self._schedule(dev.id, _do())
     # --- HA coordinator parity actions (drop into Plugin class) ---
+#
+    # === Advanced Start Mowing (instrumented) ===================================
+    # Drop this into plugin.py (inside your Plugin class). It includes:
+    # - start_mowing_advanced_action (Indigo Action callback)
+    # - _debug_before_start / _debug_after_plan helpers
+    # - Progress instrumentation and route planning sequence
+    # Keep other helper functions minimal; this is self-contained.
+
+    # ---------------------------------------------------------------------------
+    # Instrumentation helpers (place inside Plugin class – near other helpers)
+    # ---------------------------------------------------------------------------
+    async def _debug_before_start(self, dev_id: int):
+        mgr = self._mgr.get(dev_id)
+        name = self._mower_name.get(dev_id)
+        if not mgr or not name:
+            return
+        try:
+            md = mgr.mower(name)
+            rd = getattr(md, "report_data", None)
+            devs = getattr(rd, "dev", None) if rd else None
+            work = getattr(rd, "work", None) if rd else None
+            sys_status = getattr(devs, "sys_status", None)
+            charge_state = getattr(devs, "charge_state", None)
+            bp_info = getattr(work, "bp_info", None) if work else None
+            area_val = getattr(work, "area", None) if work else None
+            self.logger.debug(
+                f"[PRE-START] sys_status={sys_status} charge_state={charge_state} "
+                f"bp_info={bp_info} work.area={area_val} hex={hex(area_val) if isinstance(area_val, int) else area_val}"
+            )
+        except Exception:
+            self.logger.exception("_debug_before_start failed")
+
+    async def _debug_after_plan(self, dev_id: int, label: str):
+        mgr = self._mgr.get(dev_id)
+        name = self._mower_name.get(dev_id)
+        if not mgr or not name:
+            return
+        try:
+            md = mgr.mower(name)
+            rd = getattr(md, "report_data", None)
+            devs = getattr(rd, "dev", None) if rd else None
+            work = getattr(rd, "work", None) if rd else None
+            sys_status = getattr(devs, "sys_status", None)
+            bp_info = getattr(work, "bp_info", None) if work else None
+            area_val = getattr(work, "area", None) if work else None
+            upper16 = (area_val >> 16) & 0xFFFF if isinstance(area_val, int) else None
+            lower16 = area_val & 0xFFFF if isinstance(area_val, int) else None
+            self.logger.debug(
+                f"[{label}] sys_status={sys_status} bp_info={bp_info} work.area={area_val} "
+                f"upper16={upper16} lower16={lower16}"
+            )
+        except Exception:
+            self.logger.exception("_debug_after_plan failed")
+
+    # ---------------------------------------------------------------------------
+    # Indigo Action callback: Start Mowing (Advanced)
+    # ---------------------------------------------------------------------------
+    def _build_route_information_from_op(self, op, device_name):
+        from pymammotion.data.model import GenerateRouteInformation
+        from pymammotion.utility.device_type import DeviceType
+        from pymammotion.data.model.device_config import create_path_order
+        toward_included_angle = op.toward_included_angle if op.channel_mode == 1 else 0
+        try:
+            if DeviceType.is_luba1(device_name):
+                # HA forces angle modes off for Luba1
+                toward_mode = 0
+                toward_included_angle = 0
+            else:
+                toward_mode = op.toward_mode
+            return GenerateRouteInformation(
+                one_hashs=list(op.areas),
+                rain_tactics=op.rain_tactics,
+                speed=op.speed,
+                ultra_wave=op.ultra_wave,
+                toward=op.toward,
+                toward_included_angle=toward_included_angle,
+                toward_mode=toward_mode,
+                blade_height=op.blade_height,
+                channel_mode=op.channel_mode,
+                channel_width=op.channel_width,
+                job_mode=op.job_mode,
+                edge_mode=op.mowing_laps,
+                path_order=create_path_order(op, device_name),
+                obstacle_laps=op.obstacle_laps,
+            )
+        except Exception as ex:
+            self.logger.error(f"_build_route_information_from_op failed: {ex}")
+            return GenerateRouteInformation(one_hashs=list(op.areas))
+
+    # Minimal, practical tweak: keep your current Advanced Start flow, just add a short
+    # undock (if charging), a plan→start delay, then a quick sync + UI refresh.
+    # No progress decoding changes, no job/job_id changes, no extra helpers.
+
+    def start_mowing_advanced_action(self, action, dev):
+        import asyncio, json, re
+
+        # Reuse your existing parsing – keep this minimal:
+        def _iget(key, default=None):
+            try:
+                return int((action.props.get(key) or "").strip())
+            except Exception:
+                return default
+
+        def _fget(key, default=None):
+            try:
+                return float((action.props.get(key) or "").strip())
+            except Exception:
+                return default
+
+        def _bget(key, default=False):
+            v = action.props.get(key)
+            if isinstance(v, bool): return v
+            s = (str(v) or "").strip().lower()
+            return s in ("1", "true", "yes", "on")
+
+        # Areas (unchanged)
+        raw_areas = action.props.get("areas")
+        self.logger.debug(f"start_mowing_advanced_action: raw areas={raw_areas!r}")
+        candidates = []
+        if isinstance(raw_areas, (list, tuple)):
+            candidates = [str(x) for x in raw_areas if str(x)]
+        elif isinstance(raw_areas, str):
+            s = raw_areas.strip()
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    arr = json.loads(s)
+                    if isinstance(arr, list):
+                        candidates = [str(x) for x in arr if str(x)]
+                except Exception:
+                    candidates = []
+            if not candidates:
+                candidates = re.findall(r"\b\d{5,20}\b", s)
+        else:
+            candidates = re.findall(r"\b\d{5,20}\b", str(raw_areas or ""))
+
+        areas = []
+        seen = set()
+        for s in candidates:
+            try:
+                h = int(s)
+                if h not in seen:
+                    seen.add(h)
+                    areas.append(h)
+            except Exception:
+                self.logger.warning(f"Ignoring invalid area hash '{s}' for '{dev.name}'")
+
+        # Settings (leave as-is; defaults kept simple)
+        payload = {
+            "is_mow": _bget("is_mow", True),
+            "is_dump": _bget("is_dump", True),
+            "is_edge": _bget("is_edge", False),
+            "collect_grass_frequency": _iget("collect_grass_frequency", 10),
+            "border_mode": _iget("border_mode", 1),
+            "job_version": _iget("job_version", 0),
+            "job_id": _iget("job_id", 0),
+            "speed": _fget("speed", 0.3),
+            "ultra_wave": _iget("ultra_wave", 2),
+            "channel_mode": _iget("channel_mode", 0),
+            "channel_width": _iget("channel_width", 25),
+            "rain_tactics": _iget("rain_tactics", 1),
+            "blade_height": _iget("blade_height", 65),
+            "toward": _iget("toward", 0),
+            "toward_included_angle": _iget("toward_included_angle", 0),
+            "toward_mode": _iget("toward_mode", 0),
+            "mowing_laps": _iget("mowing_laps", 1),
+            "obstacle_laps": _iget("obstacle_laps", 0),
+            "start_progress": _iget("start_progress", 0),
+            "areas": areas,
+        }
+
+        # Friendly names for log (optional, unchanged)
+        area_names = {}
+        try:
+            mgr = self._mgr.get(dev.id)
+            mower_name = self._mower_name.get(dev.id)
+            mowing_device = mgr.mower(mower_name) if mgr and mower_name else None
+            if mowing_device and getattr(mowing_device, "map", None):
+                names = getattr(mowing_device.map, "area_name", []) or []
+                for h in payload["areas"]:
+                    nm = None
+                    for an in names:
+                        if getattr(an, "hash", None) == h:
+                            nm = getattr(an, "name", None)
+                            break
+                    area_names[h] = nm or f"area {h}"
+        except Exception:
+            pass
+        pretty = ", ".join([f"{area_names.get(h, h)} ({h})" for h in payload["areas"]]) if payload[
+            "areas"] else "last plan"
+        self.logger.info(
+            f"Advanced start mowing for '{dev.name}': areas={pretty}; speed={payload['speed']} channel_mode={payload['channel_mode']} blade={payload['blade_height']}mm start_progress={payload['start_progress']}")
+
+        async def _run():
+            name = self._mower_name.get(dev.id)
+            mgr = self._mgr.get(dev.id)
+            if not name or not mgr:
+                self._set_status(dev.id, "No mower selected")
+                return
+
+            # Quick snapshot to see if we're charging
+            try:
+                md = mgr.mower(name)
+                rd = getattr(md, "report_data", None)
+                devs = getattr(rd, "dev", None) if rd else None
+                mode_int = int(getattr(devs, "sys_status", 0)) if devs else None
+                charge_state = int(getattr(devs, "charge_state", 0)) if devs else 0
+            except Exception:
+                mode_int = None
+                charge_state = 0
+
+            # Minimal: if charging and READY, try undock then short wait
+            try:
+                from pymammotion.utility.constant import WorkMode as _WM
+            except Exception:
+                _WM = None
+            try:
+                if _WM and mode_int == int(_WM.MODE_READY) and charge_state != 0:
+                    self.logger.info(f"'{dev.name}' is charging; sending release_from_dock (minimal wait)")
+                    await self._send_command(dev.id, "release_from_dock")
+                    await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            # Plan route: mirror what you already do via OperationSettings -> GenerateRouteInformation
+            planned = False
+            try:
+                from pymammotion.data.model.device_config import OperationSettings
+                op = OperationSettings.from_dict(dict(payload))
+                # Yuka override (unchanged pattern)
+                try:
+                    from pymammotion.utility.device_type import DeviceType
+                    if name and (DeviceType.is_yuka(name) or DeviceType.is_yuka_mini(name)):
+                        op.blade_height = -10
+                except Exception:
+                    pass
+
+                from pymammotion.data.model import GenerateRouteInformation
+                # Minimal: just hand the op fields we know work for you (as per your logs)
+                gri = GenerateRouteInformation(
+                    one_hashs=list(op.areas),
+                    job_mode=getattr(op, "job_mode", 0),
+                    job_version=0,
+                    job_id=0,
+                    speed=op.speed,
+                    ultra_wave=op.ultra_wave,
+                    channel_mode=op.channel_mode,
+                    channel_width=op.channel_width,
+                    rain_tactics=op.rain_tactics,
+                    blade_height=op.blade_height,
+                    path_order=getattr(op, "path_order", b"\x00"),
+                    toward=op.toward,
+                    toward_included_angle=(op.toward_included_angle if op.channel_mode == 1 else 0),
+                    toward_mode=op.toward_mode,
+                    edge_mode=op.mowing_laps,
+                    obstacle_laps=op.obstacle_laps,
+                )
+                await self._send_command(dev.id, "generate_route_information", generate_route_information=gri)
+                planned = True
+            except Exception as ex:
+                self.logger.error(f"Plan route failed: {ex}")
+
+            if not planned:
+                self._set_status(dev.id, "Plan failed")
+                return
+
+            # Minimal: small settle delay then start, then quick sync + UI refresh
+            await asyncio.sleep(1.0)
+            try:
+                await self._send_command(dev.id, "start_job")
+            except Exception as ex:
+                self._set_status(dev.id, f"start_job error: {ex}")
+                return
+
+            await asyncio.sleep(1.0)
+            try:
+                await self._request_quick_sync(dev.id)
+            except Exception:
+                pass
+            try:
+                # Nudge combined/status without waiting for your normal poll
+                self._force_refresh_states(dev.id, delay=0.3)
+            except Exception:
+                pass
+
+        self._schedule(dev.id, _run())
 
     def set_rain_detection_action(self, action, dev):
         """Enable/disable rain detection."""
