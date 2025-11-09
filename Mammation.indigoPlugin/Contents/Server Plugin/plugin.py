@@ -102,6 +102,7 @@ class Plugin(indigo.PluginBase):
         # In Plugin.__init__ (after super().__init__):
         self._unknown_area_logged = {}  # dev_id -> set([hashes])
         self._last_map_request = {}  # dev_id -> monotonic timestamp
+        self._last_cloud_relogin = {}  # dev_id -> monotonic timestamp
 
         # Logging setup (pattern as in Device Timer / EVSEMaster)
         if hasattr(self, "indigo_log_handler") and self.indigo_log_handler:
@@ -1748,7 +1749,35 @@ class Plugin(indigo.PluginBase):
             self._set_status(dev_id, "Poll error")
             self.logger.exception("_refresh_states top-level failure")
 
+    async def _cloud_relogin_once(self, dev_id: int, min_interval: float = 60.0) -> None:
+        """
+        Re-login current Mammotion manager for this Indigo device if cooldown elapsed.
+        Quietly returns if account/password missing or already attempted recently.
+        """
+        import time
+        now = time.monotonic()
+        last = self._last_cloud_relogin.get(dev_id, 0.0)
+        if (now - last) < min_interval:
+            return
+        self._last_cloud_relogin[dev_id] = now
 
+        dev = indigo.devices.get(dev_id)
+        mgr = self._mgr.get(dev_id)
+        if not dev or not mgr:
+            return
+        props = dev.pluginProps or {}
+        account = (props.get("account") or "").strip()
+        password = (props.get("password") or "").strip()
+        if not account or not password:
+            self.logger.debug(f"cloud_relogin: missing credentials for dev {dev_id}")
+            return
+
+        try:
+            self.logger.debug(f"cloud_relogin: attempting re-login for '{dev.name}'")
+            await mgr.login_and_initiate_cloud(account, password)
+            self.logger.debug(f"cloud_relogin: success for '{dev.name}'")
+        except Exception as ex:
+            self.logger.debug(f"cloud_relogin: failed for '{dev.name}': {ex}")
 
     # _send_command stripped (movement verbs no sync/map; add sys_status logging)
     async def _send_command(self, dev_id: int, key: str, **kwargs):
@@ -1761,15 +1790,18 @@ class Plugin(indigo.PluginBase):
             self._set_status(dev_id, "No mower selected")
             return
         nosync = {"move_forward", "move_back", "move_left", "move_right"}
+        identity_error = False
         try:
             device = mgr.get_device_by_name(name)
             sys_status = getattr(getattr(device, "state", None), "report_data", None)
             sys_status = getattr(getattr(sys_status, "dev", None), "sys_status", None)
             self.logger.debug(f"_send_command ctx key={key} sys_status={sys_status} kwargs={kwargs}")
+
             if kwargs:
                 await mgr.send_command_with_args(name, key, **kwargs)
             else:
                 await mgr.send_command(name, key)
+
             if key not in nosync:
                 try:
                     await mgr.start_sync(name, retry=1)
@@ -1777,7 +1809,9 @@ class Plugin(indigo.PluginBase):
                     pass
             else:
                 self.logger.debug(f"Skip sync for movement key={key}")
+
             self._set_status(dev_id, f"Command sent: {key}")
+
             refresh_after = {
                 "start_job": 0.6,
                 "cancel_job": 0.6,
@@ -1788,17 +1822,45 @@ class Plugin(indigo.PluginBase):
                 "move_left": 0.3,
                 "move_right": 0.3,
             }
-
-            try:
-                delay = refresh_after.get(key)
-                if delay is not None:
-                    self._force_refresh_states(dev_id, delay=delay, min_interval=(
-                        0.8 if key not in ("move_forward", "move_back", "move_left", "move_right") else 1.5))
-            except Exception:
-                pass
+            delay = refresh_after.get(key)
+            if delay is not None:
+                self._force_refresh_states(
+                    dev_id,
+                    delay=delay,
+                    min_interval=(0.8 if key not in nosync else 1.5)
+                )
 
         except Exception as ex:
-            self._set_status(dev_id, f"Command error: {ex}")
+            msg = str(ex)
+            if ("identityId is blank" in msg) or ("29003" in msg):
+                identity_error = True
+                self.logger.warning(
+                    f"Cloud session expired (29003) for '{dev.name}' during '{key}'. Re-login and retry once.")
+            else:
+                self._set_status(dev_id, f"Command error: {ex}")
+
+        if identity_error:
+            # Attempt single re-login then one retry of original command
+            try:
+                await self._cloud_relogin_once(dev_id)
+                await asyncio.sleep(1.0)
+                # Retry same command once
+                self.logger.debug(f"Retrying command '{key}' after re-login for '{dev.name}'")
+                if kwargs:
+                    await mgr.send_command_with_args(name, key, **kwargs)
+                else:
+                    await mgr.send_command(name, key)
+                # Optional sync
+                if key not in nosync:
+                    try:
+                        await mgr.start_sync(name, retry=1)
+                    except Exception:
+                        pass
+                self._set_status(dev_id, f"Command retried: {key}")
+                self._force_refresh_states(dev_id, delay=0.6)
+            except Exception as rex:
+                self.logger.error(f"Retry failed for '{dev.name}' after identity refresh: {rex}")
+                self._set_status(dev_id, f"Command error: {rex}")
 
     ########################################
     # State helpers
