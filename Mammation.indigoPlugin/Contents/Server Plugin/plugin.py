@@ -1401,19 +1401,18 @@ class Plugin(indigo.PluginBase):
                 self.logger.exception("charging decode failed")
 
             # Blades: robust detection (cut_knife_ctrl first; fall back to blade_status)
+            # Simplified blades_on: working mode = True
             blades_on_val = None
             try:
-                # Primary: device 'dev' section often exposes cutter on/off
-                ck = getattr(dev_status, "cut_knife_ctrl", None)
-                if ck is not None:
-                    blades_on_val = bool(int(ck) != 0)
-                # Fallback: mower_state.blade_status boolean (may be present on some models)
-                if blades_on_val is None:
-                    blades_on_val = bool(getattr(mower_state, "blade_status", False))
-                if "blades_on" in allowed and blades_on_val is not None:
-                    kv.append({"key": "blades_on", "value": bool(blades_on_val)})
+                from pymammotion.utility.constant.device_constant import WorkMode as _WM2
+                if mode_int is not None and _WM2 and mode_int == int(_WM2.MODE_WORKING):
+                    blades_on_val = True
+                else:
+                    blades_on_val = False
+                if "blades_on" in allowed:
+                    kv.append({"key": "blades_on", "value": blades_on_val})
             except Exception:
-                self.logger.exception("blades_on decode failed")
+                pass
 
             # blade_rpm if provided (not all firmwares provide this)
             try:
@@ -2481,10 +2480,12 @@ class Plugin(indigo.PluginBase):
                     area_names[h] = nm or f"area {h}"
         except Exception:
             pass
-        pretty = ", ".join([f"{area_names.get(h, h)} ({h})" for h in payload["areas"]]) if payload[
-            "areas"] else "last plan"
+        pretty = ", ".join([f"{area_names.get(h, h)} ({h})" for h in payload["areas"]]) if payload["areas"] else "last plan"
         self.logger.info(
-            f"Advanced start mowing for '{dev.name}': areas={pretty}; speed={payload['speed']} channel_mode={payload['channel_mode']} blade={payload['blade_height']}mm start_progress={payload['start_progress']}")
+            f"Advanced start mowing for '{dev.name}': areas={pretty}; "
+            f"speed={payload['speed']} channel_mode={payload['channel_mode']} "
+            f"blade={payload['blade_height']}mm start_progress={payload['start_progress']}"
+        )
 
         async def _run():
             name = self._mower_name.get(dev.id)
@@ -2493,7 +2494,15 @@ class Plugin(indigo.PluginBase):
                 self._set_status(dev.id, "No mower selected")
                 return
 
-            # Quick snapshot to see if we're charging
+            # If docked & charging, release
+            try:
+                from pymammotion.utility.constant.device_constant import WorkMode as _WM
+            except Exception:
+                try:
+                    from pymammotion.utility.constant import WorkMode as _WM
+                except Exception:
+                    _WM = None
+
             try:
                 md = mgr.mower(name)
                 rd = getattr(md, "report_data", None)
@@ -2504,25 +2513,31 @@ class Plugin(indigo.PluginBase):
                 mode_int = None
                 charge_state = 0
 
-            # Minimal: if charging and READY, try undock then short wait
-            try:
-                from pymammotion.utility.constant import WorkMode as _WM
-            except Exception:
-                _WM = None
-            try:
-                if _WM and mode_int == int(_WM.MODE_READY) and charge_state != 0:
-                    self.logger.info(f"'{dev.name}' is charging; sending release_from_dock (minimal wait)")
+            if _WM and mode_int == int(_WM.MODE_READY) and charge_state != 0:
+                self.logger.info(f"'{dev.name}' is charging; sending release_from_dock")
+                try:
                     await self._send_command(dev.id, "release_from_dock")
-                    await asyncio.sleep(1.5)
-            except Exception:
-                pass
+                    await asyncio.sleep(1.2)
+                except Exception:
+                    pass
 
-            # Plan route: mirror what you already do via OperationSettings -> GenerateRouteInformation
+            # Plan like HA
             planned = False
             try:
-                from pymammotion.data.model.device_config import OperationSettings
+                from pymammotion.data.model.device_config import OperationSettings, create_path_order
                 op = OperationSettings.from_dict(dict(payload))
-                # Yuka override (unchanged pattern)
+
+                # Force is_dump False if no collector installed (HA parity)
+                try:
+                    device = mgr.get_device_by_name(name)
+                    coll = getattr(getattr(getattr(device, "state", None), "report_data", None), "dev", None)
+                    coll = getattr(getattr(coll, "collector_status", None), "collector_installation_status", None)
+                    if coll == 0:
+                        op.is_dump = False
+                except Exception:
+                    pass
+
+                # Yuka override
                 try:
                     from pymammotion.utility.device_type import DeviceType
                     if name and (DeviceType.is_yuka(name) or DeviceType.is_yuka_mini(name)):
@@ -2530,26 +2545,28 @@ class Plugin(indigo.PluginBase):
                 except Exception:
                     pass
 
+                # Minimal path order like HA
+                try:
+                    op.path_order = create_path_order(op, name) or b"\x01"
+                except Exception:
+                    op.path_order = b"\x01"
+
+                # Build the HA subset of GRI fields (don’t send job_mode/edge_mode/obstacle_laps/etc.)
                 from pymammotion.data.model import GenerateRouteInformation
-                # Minimal: just hand the op fields we know work for you (as per your logs)
                 gri = GenerateRouteInformation(
                     one_hashs=list(op.areas),
-                    job_mode=getattr(op, "job_mode", 0),
-                    job_version=0,
-                    job_id=0,
+                    rain_tactics=op.rain_tactics,
                     speed=op.speed,
                     ultra_wave=op.ultra_wave,
-                    channel_mode=op.channel_mode,
-                    channel_width=op.channel_width,
-                    rain_tactics=op.rain_tactics,
-                    blade_height=op.blade_height,
-                    path_order=getattr(op, "path_order", b"\x00"),
                     toward=op.toward,
                     toward_included_angle=(op.toward_included_angle if op.channel_mode == 1 else 0),
                     toward_mode=op.toward_mode,
-                    edge_mode=op.mowing_laps,
-                    obstacle_laps=op.obstacle_laps,
+                    blade_height=op.blade_height,
+                    channel_mode=op.channel_mode,
+                    channel_width=op.channel_width,
+                    path_order=op.path_order,
                 )
+                self.logger.debug(f"Planning route (HA subset) height={op.blade_height} speed={op.speed}")
                 await self._send_command(dev.id, "generate_route_information", generate_route_information=gri)
                 planned = True
             except Exception as ex:
@@ -2559,24 +2576,33 @@ class Plugin(indigo.PluginBase):
                 self._set_status(dev.id, "Plan failed")
                 return
 
-            # Minimal: small settle delay then start, then quick sync + UI refresh
-            await asyncio.sleep(1.0)
+            # Start job (firmware will spin blades once WORKING)
+            await asyncio.sleep(0.8)
             try:
                 await self._send_command(dev.id, "start_job")
             except Exception as ex:
                 self._set_status(dev.id, f"start_job error: {ex}")
                 return
 
-            await asyncio.sleep(1.0)
+            # Optional: short wait to observe transition, then quick sync
+            for _ in range(8):
+                await asyncio.sleep(1.0)
+                try:
+                    md = mgr.mower(name)
+                    rd = getattr(md, "report_data", None)
+                    devs = getattr(rd, "dev", None) if rd else None
+                    mode_now = int(getattr(devs, "sys_status", 0)) if devs else 0
+                    if _WM and mode_now == int(_WM.MODE_WORKING):
+                        self.logger.info(f"'{dev.name}' transitioned to WORKING")
+                        break
+                except Exception:
+                    pass
+
             try:
                 await self._request_quick_sync(dev.id)
             except Exception:
                 pass
-            try:
-                # Nudge combined/status without waiting for your normal poll
-                self._force_refresh_states(dev.id, delay=0.3)
-            except Exception:
-                pass
+            self._force_refresh_states(dev.id, delay=0.5)
 
         self._schedule(dev.id, _run())
 
