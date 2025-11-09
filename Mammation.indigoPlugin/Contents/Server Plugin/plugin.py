@@ -128,15 +128,17 @@ class Plugin(indigo.PluginBase):
             indigo.server.log(f"Failed to create IndigoLogHandler: {exc}", isError=True)
 
         try:
-            logs_dir = path.join(indigo.server.getInstallFolderPath(), "Logs", "Plugins")
-            os.makedirs(logs_dir, exist_ok=True)
-            logfile = path.join(logs_dir, f"{plugin_id}.log")
-            self.plugin_file_handler = logging.handlers.RotatingFileHandler(logfile, maxBytes=2_000_000, backupCount=3)
-            pfmt = logging.Formatter(
-                "%(asctime)s.%(msecs)03d\t[%(levelname)8s] %(name)20s.%(funcName)-25s%(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-            self.plugin_file_handler.setFormatter(pfmt)
+            #logs_dir = path.join(indigo.server.getInstallFolderPath(), "Logs", "Plugins", self.plugin_id)
+            #os.makedirs(logs_dir, exist_ok=True)
+            #logfile = path.join(logs_dir, f"{plugin_id}.log")
+            #if getattr(self, "plugin_file_handler", None):
+            #    self.logger.removeHandler(self.plugin_file_handler)
+            #self.plugin_file_handler = logging.handlers.RotatingFileHandler(logfile, maxBytes=2_000_000, backupCount=3)
+            #pfmt = logging.Formatter(
+            #    "%(asctime)s.%(msecs)03d\t[%(levelname)8s] %(name)20s.%(funcName)-25s%(message)s",
+            #    datefmt="%Y-%m-%d %H:%M:%S",
+            #)
+            #self.plugin_file_handler.setFormatter(pfmt)
             self.plugin_file_handler.setLevel(self.fileloglevel)
             self.logger.addHandler(self.plugin_file_handler)
         except Exception as exc:
@@ -154,24 +156,36 @@ class Plugin(indigo.PluginBase):
 
         ##
         # Hook PyMammotion loggers to Indigo handlers so DEBUG from the library shows up
+        # --- Diagnostic attach of pymammotion loggers (minimal) ---
+
+        # Route pymammotion logs: logger always DEBUG; handlers control what’s shown
         try:
-            debug_lib = bool(self.pluginPrefs.get("debugLibrary", False))
-            import logging as _l
-            ih = self.indigo_log_handler
-            fh = self.plugin_file_handler
-            for ln in ("pymammotion", "pymammotion.http", "pymammotion.aliyun", "pymammotion.mqtt",
-                       "pymammotion.mammotion"):
-                lg = _l.getLogger(ln)
-                lg.setLevel(_l.DEBUG if debug_lib else _l.INFO)
-                if ih and ih not in lg.handlers:
-                    lg.addHandler(ih)
-                if fh and fh not in lg.handlers:
-                    lg.addHandler(fh)
-                lg.propagate = False
-            if debug_lib:
-                self.logger.debug("PyMammotion library DEBUG logging enabled")
+            # 1. Root logger: make sure we can capture everything to file.
+            root_logger = logging.getLogger()
+            if self.plugin_file_handler not in root_logger.handlers:
+                root_logger.addHandler(self.plugin_file_handler)
+            # Keep root permissive so child DEBUG flows (guide: handlers filter)
+            if root_logger.level > logging.DEBUG:
+                root_logger.setLevel(logging.DEBUG)
+
+            # 2. Plugin logger already has IndigoLogHandler + file handler.
+            #    We leave that as-is; no change needed.
+
+            # 3. Library base logger: remove its own handlers (to prevent it blocking propagation),
+            #    set NOTSET so it inherits root’s DEBUG, and allow propagation.
+            pm = logging.getLogger("pymammotion")
+            pm.handlers[:] = []          # strip any handlers library may have added
+            pm.setLevel(logging.NOTSET)  # inherit from root (DEBUG)
+            pm.propagate = True          # bubble up to root (file handler) AND to any parent chain
+
+            # 4. Emit a test line (will appear once) so you can confirm in file quickly.
+            pm.debug("[LOGTEST] pymammotion logger attached (propagate=TRUE -> root)")
+
+            self.logger.debug("Library logging hooked (root captures pymammotion)")
         except Exception as exc:
-            self.logger.debug(f"Could not attach PyMammotion loggers: {exc}")
+            self.logger.debug(f"Library logging attach failed: {exc}")
+
+        logging.getLogger("pymammotion").addHandler(self.plugin_file_handler)
 
         self.logger.info("{0:=^120}".format(" End Initializing "))
 
@@ -776,20 +790,20 @@ class Plugin(indigo.PluginBase):
             self.plugin_file_handler.setLevel(self.fileloglevel)
 
             # PyMammotion logger levels + handlers
-            debug_lib = bool(values_dict.get("debugLibrary", False))
-            for ln in ("pymammotion", "pymammotion.http", "pymammotion.aliyun", "pymammotion.mqtt",
-                       "pymammotion.mammotion"):
-                lg = _l.getLogger(ln)
-                lg.setLevel(_l.DEBUG if debug_lib else _l.INFO)
-                # ensure our handlers are present
-                if self.indigo_log_handler not in lg.handlers:
-                    lg.addHandler(self.indigo_log_handler)
-                if self.plugin_file_handler not in lg.handlers:
-                    lg.addHandler(self.plugin_file_handler)
-                lg.propagate = False
+            try:
+                self.indigo_log_handler.setLevel(self.logLevel)
+                self.plugin_file_handler.setLevel(self.fileloglevel)
+                # Re-confirm propagation (in case another part changed it)
+                pm = logging.getLogger("pymammotion")
+                pm.propagate = True
+                pm.setLevel(logging.NOTSET)
+                self.logger.debug(
+                    f"Logging prefs applied: Indigo={logging.getLevelName(self.indigo_log_handler.level)}, "
+                    f"File={logging.getLevelName(self.plugin_file_handler.level)}"
+                )
+            except Exception as exc:
+                self.logger.debug(f"Pref logging update failed: {exc}")
 
-            self.logger.debug(
-                f"Applied logging prefs: EventLog={_l.getLevelName(self.logLevel)}, File={_l.getLevelName(self.fileloglevel)}, PyMammotion={'DEBUG' if debug_lib else 'INFO'}")
         except Exception as exc:
             self.logger.exception(exc)
 
@@ -939,7 +953,7 @@ class Plugin(indigo.PluginBase):
                     self._set_status(dev_id, "No mower found")
                     raise RuntimeError("No mower found on account")
                 self._mower_name[dev_id] = mower_name
-                self.logger.info(f"'{dev.name}' controlling mower: {mower_name}")
+                self.logger.info(f"'{dev.name}' now Connected.  Controlling mower name: {mower_name}")
 
                 # inside async def _session_manager(self, dev_id: int): after:
                 # self._mower_name[dev_id] = mower_name
