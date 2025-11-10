@@ -43,8 +43,10 @@ def start_webrtc_http(plugin):
             from aiohttp import web
             import json
 
-            async def _json_error(msg, status=400):
-                return web.json_response({"ok": False, "error": msg}, status=status)
+            # Make this a plain function so every handler can "return _json_error(...)"
+            def _json_error(msg, status=400):
+                return web.json_response({"ok": False, "error": str(msg)}, status=status)
+
 
             # Movement dispatcher (optional – wire to your existing move handlers)
             def _send_move_command(dev_id: int, direction: str, speed: float, continuous: bool):
@@ -125,6 +127,11 @@ def start_webrtc_http(plugin):
                         pass
                 if account_id is None:
                     return _json_error("userAccount not available yet")
+                # Preflight: brief re-login to avoid 29003 on idle sessions (debounced inside plugin)
+                try:
+                    await plugin._cloud_relogin_once(dev.id, min_interval=5.0)
+                except Exception:
+                    pass
 
                 # Pre-refresh (parity with HA; ignored result)
                 try:
@@ -732,7 +739,28 @@ def start_webrtc_http(plugin):
             reloadBtn.addEventListener('click', ()=>location.reload());
             //fsBtn.addEventListener('click', toggleFullscreen);
             joyToggle.addEventListener('click', toggleJoystick);
-
+            
+                        // --- Auto-start (5s delayed) unless disabled via ?auto=0 ---
+            (function autoStartMaybe(){
+              try{
+                const qp=new URLSearchParams(location.search);
+                const autoParam = qp.get('auto');
+                if(autoParam === '0'){
+                  setStatus('Auto-start disabled (auto=0).');
+                  return;
+                }
+                // Delay 5s to allow plugin session and tokens to become available
+                setTimeout(()=>{
+                  if(!client){
+                    setStatus('Auto-starting stream…');
+                    startAll();
+                  }
+                }, 2000);
+              }catch(e){
+                // Silent fail; user can click Play manually
+              }
+            })();
+            
             // Auto-show joystick if ?joystick=1
             (function initJoy(){
               const qp=new URLSearchParams(location.search);

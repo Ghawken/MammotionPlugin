@@ -1789,6 +1789,15 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"cloud_relogin: attempting re-login for '{dev.name}'")
             await mgr.login_and_initiate_cloud(account, password)
             self.logger.debug(f"cloud_relogin: success for '{dev.name}'")
+
+            # IMPORTANT: re-enable cloud + callbacks and re-prime telemetry for the selected mower
+            try:
+                mower_name = self._mower_name.get(dev_id)
+                if mower_name:
+                    await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
+                    await self._prime_reporting(dev_id, mgr)
+            except Exception as ex2:
+                self.logger.debug(f"cloud_relogin: post-login bind/prime failed for '{dev.name}': {ex2}")
         except Exception as ex:
             self.logger.debug(f"cloud_relogin: failed for '{dev.name}': {ex}")
 
