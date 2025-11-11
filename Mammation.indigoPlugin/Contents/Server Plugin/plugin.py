@@ -185,7 +185,7 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.debug(f"Library logging attach failed: {exc}")
 
-        logging.getLogger("pymammotion").addHandler(self.plugin_file_handler)
+       # logging.getLogger("pymammotion").addHandler(self.plugin_file_handler)
 
         self.logger.info("{0:=^120}".format(" End Initializing "))
 
@@ -1127,7 +1127,7 @@ class Plugin(indigo.PluginBase):
         try:
             cloud = getattr(device, "cloud", None)
             if cloud and hasattr(cloud, "set_notification_callback"):
-                def _cloud_notify(res):
+                async def _cloud_notify(res):
                     # Also detect when map names arrive so we don’t keep requesting
                     try:
                         md = mgr.mower(mower_name)
