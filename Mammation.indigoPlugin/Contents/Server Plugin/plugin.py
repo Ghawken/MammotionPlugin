@@ -371,7 +371,7 @@ class Plugin(indigo.PluginBase):
         ## move to self file - self._start_webrtc_http()
         from webrtc import start_webrtc_http
         start_webrtc_http(self)
-        self.logger.info(f"Open player: http://<HOST>:{self._webrtc_port}/webrtc/player")
+        self.logger.info(f"Access Video Stream: http://{self._host_ip_for_links()}:{self._webrtc_port}/webrtc/player")
 
 
 
