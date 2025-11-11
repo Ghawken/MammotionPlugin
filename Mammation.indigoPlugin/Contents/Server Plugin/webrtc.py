@@ -139,13 +139,25 @@ def start_webrtc_http(plugin):
                 except Exception:
                     pass
 
-                # Join (enter_state=1)
+                # Join (with one retry on 29003)
                 try:
                     from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
                     cmd = MammotionCommand(mower_name, int(account_id)).device_agora_join_channel_with_position(enter_state=1)
                     await device.cloud_client.send_cloud_command(device.iot_id, cmd)
                 except Exception as ex:
-                    return _json_error(f"join failed: {ex}")
+                    txt = str(ex)
+                    if ("29003" in txt) or ("identityId is blank" in txt):
+                        try:
+                            # Immediate re-login and short wait, then retry once
+                            await plugin._cloud_relogin_once(dev.id, min_interval=0.0)
+                            await asyncio.sleep(1.0)
+                            from pymammotion.mammotion.commands.mammotion_command import MammotionCommand as _MC
+                            cmd2 = _MC(mower_name, int(account_id)).device_agora_join_channel_with_position(enter_state=1)
+                            await device.cloud_client.send_cloud_command(device.iot_id, cmd2)
+                        except Exception as ex2:
+                            return _json_error(f"join failed: {ex2}")
+                    else:
+                        return _json_error(f"join failed: {ex}")
 
                 # Small delay, then fetch fresh subscription
                 try:

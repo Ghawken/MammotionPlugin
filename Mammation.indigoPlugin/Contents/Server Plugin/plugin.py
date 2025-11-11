@@ -1790,14 +1790,33 @@ class Plugin(indigo.PluginBase):
             await mgr.login_and_initiate_cloud(account, password)
             self.logger.debug(f"cloud_relogin: success for '{dev.name}'")
 
-            # IMPORTANT: re-enable cloud + callbacks and re-prime telemetry for the selected mower
+            # Re-enable per-device cloud transport and re-prime telemetry for the selected mower.
             try:
                 mower_name = self._mower_name.get(dev_id)
                 if mower_name:
-                    await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
-                    await self._prime_reporting(dev_id, mgr)
+                    # Ensure cloud transport is running
+                    try:
+                        device = mgr.get_device_by_name(mower_name)
+                        cloud = getattr(device, "cloud", None)
+                        if cloud and getattr(cloud, "stopped", False):
+                            await cloud.start()
+                    except Exception:
+                        pass
+                    # Re-bind callbacks and (re)start map sync if needed
+                    try:
+                        await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Small delay to avoid racing token propagation, then prime reporting.
+            try:
+                await asyncio.sleep(1.0)
+                await self._prime_reporting(dev_id, mgr)
             except Exception as ex2:
-                self.logger.debug(f"cloud_relogin: post-login bind/prime failed for '{dev.name}': {ex2}")
+                self.logger.debug(f"cloud_relogin: post-login prime failed for '{dev.name}': {ex2}")
+
         except Exception as ex:
             self.logger.debug(f"cloud_relogin: failed for '{dev.name}': {ex}")
 
