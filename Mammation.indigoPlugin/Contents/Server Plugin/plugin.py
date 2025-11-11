@@ -103,6 +103,8 @@ class Plugin(indigo.PluginBase):
         self._unknown_area_logged = {}  # dev_id -> set([hashes])
         self._last_map_request = {}  # dev_id -> monotonic timestamp
         self._last_cloud_relogin = {}  # dev_id -> monotonic timestamp
+        self._cloud_relogin_in_progress = {}  # dev_id -> bool (true while relogin running)
+        self._pending_commands = {}           # dev_id -> list of (key, kwargs) tuples queued during relogin
 
         # Logging setup (pattern as in Device Timer / EVSEMaster)
         if hasattr(self, "indigo_log_handler") and self.indigo_log_handler:
@@ -245,6 +247,7 @@ class Plugin(indigo.PluginBase):
             return [("err", "Error building list")]
 
     # New: async fetch of areas from the library (best-effort across library versions)
+    # PATCH ensure_manual_mode to recover on auth expiry
     async def ensure_manual_mode(self, dev_id):
         indigo_dev = indigo.devices.get(dev_id)
         mgr = self._mgr.get(dev_id)
@@ -261,7 +264,17 @@ class Plugin(indigo.PluginBase):
             await device.cloud_client.send_cloud_command(device.iot_id, cmd)
             self.logger.info("Entered remote manual control mode")
         except Exception as ex:
-            self.logger.error(f"Enter manual control failed: {ex}")
+            if self._is_auth_error(ex):
+                self.logger.warning("Manual control enter failed due to auth; re-login and retry once")
+                await self._cloud_relogin_once(dev_id)
+                await asyncio.sleep(1.0)
+                try:
+                    await device.cloud_client.send_cloud_command(device.iot_id, cmd)
+                    self.logger.info("Entered remote manual control mode (after re-login)")
+                except Exception as rex:
+                    self.logger.error(f"Enter manual control failed after re-login: {rex}")
+            else:
+                self.logger.error(f"Enter manual control failed: {ex}")
 
     async def _fetch_areas(self, dev_id: int):
         """
@@ -373,7 +386,37 @@ class Plugin(indigo.PluginBase):
         start_webrtc_http(self)
         self.logger.info(f"Access Video Stream: http://{self._host_ip_for_links()}:{self._webrtc_port}/webrtc/player")
 
-
+    # Add this helper inside Plugin class (near other small helpers)
+    def _is_auth_error(self, ex) -> bool:
+        """
+        Return True if the exception indicates Mammotion cloud auth is invalid/expired.
+        Minimal and robust: checks code attribute, first arg, and message substrings.
+        """
+        try:
+            code = getattr(ex, "code", None)
+            if isinstance(code, int) and code in (29002, 29003, 460):
+                return True
+            # Some builds stick code as first arg
+            if ex.args and isinstance(ex.args[0], int) and ex.args[0] in (29002, 29003, 460):
+                return True
+        except Exception:
+            pass
+        s = str(ex)
+        # Safe substring checks (library returns human text like "identityId is blank" / "iotToken is blank")
+        return any(
+            t in s
+            for t in (
+                "identityId is blank",  # 29003 typical text
+                "iotToken is blank",  # 460 typical text
+                "code:29003",
+                "code:29002",
+                "code:460",
+                " 29003",
+                " 29002",
+                " 460",
+                "token invalid",
+            )
+        )
 
     def _install_aiohttp_base_url_shim(self) -> None:
         """
@@ -1044,8 +1087,8 @@ class Plugin(indigo.PluginBase):
             await mgr.send_command(name, "get_report_cfg")
             try:
                 from pymammotion.proto import RptAct, RptInfoType
-                await mgr.send_command_with_args(
-                    name,
+                await self._send_command(
+                    dev_id,
                     "request_iot_sys",
                     rpt_act=RptAct.RPT_START,
                     rpt_info_type=[
@@ -1063,8 +1106,8 @@ class Plugin(indigo.PluginBase):
                 )
             except Exception as ex:
                 self.logger.debug(f"request_iot_sys enums failed, trying minimal start: {ex}")
-                await mgr.send_command_with_args(
-                    name,
+                await self._send_command(
+                    dev_id,
                     "request_iot_sys",
                     timeout=10000,
                     period=3000,
@@ -1100,6 +1143,23 @@ class Plugin(indigo.PluginBase):
         except Exception:
             pass
 
+    def _async_wrap(self, fn):
+        """
+        Ensure a callable is awaitable (async). If fn is already a coroutine function,
+        return it unchanged; otherwise create a trivial async wrapper.
+        """
+        if asyncio.iscoroutinefunction(fn):
+            return fn
+
+        async def _wrapped(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as ex:
+                # Keep noise low; handler failures should not crash gather()
+                self.logger.debug(f"async_wrap handler raised: {ex}")
+        return _wrapped
+
+
     async def _enable_cloud_and_bind(self, dev_id: int, mgr, mower_name: str):
         """
         Enable cloud updates and bind callbacks like HA; start map sync once and throttle area-name fetches.
@@ -1124,38 +1184,61 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"Enable cloud failed for '{mower_name}': {ex}")
 
         # Bind a single cloud notification callback – on any inbound, refresh states
+        # Bind a single cloud notification callback – on any inbound, refresh states
         try:
             cloud = getattr(device, "cloud", None)
             if cloud and hasattr(cloud, "set_notification_callback"):
                 async def _cloud_notify(res):
-                    # Also detect when map names arrive so we don’t keep requesting
+                    # Detect when map names arrive so we don’t keep requesting
                     try:
                         md = mgr.mower(mower_name)
                         m = getattr(md, "map", None)
                         names = getattr(m, "area_name", []) if m else []
-                        if names and len(names) > 0:
-                            if not self._area_names_ready.get(dev_id, False):
-                                self.logger.debug(f"Area names now present (count={len(names)}) for '{mower_name}'")
+                        if names and len(names) > 0 and not self._area_names_ready.get(dev_id, False):
+                            self.logger.debug(f"Area names now present (count={len(names)}) for '{mower_name}'")
                             self._area_names_ready[dev_id] = True
                     except Exception:
                         pass
                     self._schedule_state_refresh(dev_id)
 
-                cloud.set_notification_callback(_cloud_notify)
+                cloud.set_notification_callback(self._async_wrap(_cloud_notify))
+                # Optional: if the cloud exposes an error callback, use it to trigger re-login on 29003/identity blank
+                try:
+                    if hasattr(cloud, "set_error_callback"):
+                        async def _cloud_error(exc):
+                            msg = str(exc)
+                            if ("29003" in msg) or ("identityId is blank" in msg):
+                                self.logger.warning(f"Cloud error detected (session expired) for '{mower_name}', scheduling re-login")
+                                try:
+                                    await self._cloud_relogin_once(dev_id)
+                                except Exception:
+                                    pass
+                        cloud.set_error_callback(_cloud_error)
+                except Exception:
+                    pass
+
+
             else:
                 self.logger.debug("cloud.set_notification_callback not available on this build")
         except Exception as ex:
             self.logger.debug(f"Bind cloud notification failed: {ex}")
 
         # Bind state_manager callbacks (properties/status/device events)
+        # Bind state_manager callbacks (properties/status/device events) as async
         try:
             sm = getattr(device, "state_manager", None)
             if sm and hasattr(sm, "properties_callback"):
-                sm.properties_callback.add_subscribers(lambda p: self._schedule_state_refresh(dev_id))
+                sm.properties_callback.add_subscribers(
+                    self._async_wrap(lambda p: self._schedule_state_refresh(dev_id))
+                )
             if sm and hasattr(sm, "status_callback"):
-                sm.status_callback.add_subscribers(lambda s: self._schedule_state_refresh(dev_id))
+                sm.status_callback.add_subscribers(
+                    self._async_wrap(lambda s: self._schedule_state_refresh(dev_id))
+                )
             if sm and hasattr(sm, "device_event_callback"):
-                sm.device_event_callback.add_subscribers(lambda e: self._schedule_state_refresh(dev_id))
+                sm.device_event_callback.add_subscribers(
+                    self._async_wrap(lambda e: self._schedule_state_refresh(dev_id))
+                )
         except Exception as ex:
             self.logger.debug(f"Bind state_manager callbacks failed: {ex}")
 
@@ -1208,7 +1291,6 @@ class Plugin(indigo.PluginBase):
 
     # ========== Lightweight periodic: refresh + keep report stream warm ==========
     async def _periodic_status(self, dev_id: int):
-        # Shorter interval while working; otherwise slower. Keep get_report_cfg warm every ~60s.
         keepalive_counter = 0
         try:
             while not self.stopThread:
@@ -1217,18 +1299,12 @@ class Plugin(indigo.PluginBase):
                 keepalive_counter = (keepalive_counter + 1) % 6  # every ~6 cycles
                 if keepalive_counter == 0:
                     try:
-                        mgr = self._mgr.get(dev_id)
-                        name = self._mower_name.get(dev_id)
-                        if mgr and name:
-                            await mgr.send_command(name, "get_report_cfg")
+                        await self._send_command(dev_id, "get_report_cfg")
                     except Exception:
                         pass
 
-                # If working, poll faster (like HA WORKING_INTERVAL); otherwise default
                 try:
                     dev = indigo.devices.get(dev_id)
-                    wm = (dev.states.get("state_raw") or "").strip()
-                    # crude: treat 'MODE_WORKING' or '19/13' combos as active
                     sleep_s = 5 if ("WORKING" in dev.states.get("work_mode", "")) else 30
                 except Exception:
                     sleep_s = 30
@@ -1765,7 +1841,7 @@ class Plugin(indigo.PluginBase):
     async def _cloud_relogin_once(self, dev_id: int, min_interval: float = 60.0) -> None:
         """
         Re-login current Mammotion manager for this Indigo device if cooldown elapsed.
-        Quietly returns if account/password missing or already attempted recently.
+        Debounced: skips if already in progress. Queued commands are flushed after success.
         """
         import time
         now = time.monotonic()
@@ -1774,15 +1850,23 @@ class Plugin(indigo.PluginBase):
             return
         self._last_cloud_relogin[dev_id] = now
 
+        # Prevent duplicate concurrent relogins
+        if self._cloud_relogin_in_progress.get(dev_id, False):
+            return
+        self._cloud_relogin_in_progress[dev_id] = True
+
         dev = indigo.devices.get(dev_id)
         mgr = self._mgr.get(dev_id)
         if not dev or not mgr:
+            self._cloud_relogin_in_progress[dev_id] = False
             return
+
         props = dev.pluginProps or {}
         account = (props.get("account") or "").strip()
         password = (props.get("password") or "").strip()
         if not account or not password:
             self.logger.debug(f"cloud_relogin: missing credentials for dev {dev_id}")
+            self._cloud_relogin_in_progress[dev_id] = False
             return
 
         try:
@@ -1790,37 +1874,53 @@ class Plugin(indigo.PluginBase):
             await mgr.login_and_initiate_cloud(account, password)
             self.logger.debug(f"cloud_relogin: success for '{dev.name}'")
 
-            # Re-enable per-device cloud transport and re-prime telemetry for the selected mower.
+            # Re-enable cloud transport / callbacks / telemetry
             try:
                 mower_name = self._mower_name.get(dev_id)
                 if mower_name:
-                    # Ensure cloud transport is running
-                    try:
-                        device = mgr.get_device_by_name(mower_name)
-                        cloud = getattr(device, "cloud", None)
-                        if cloud and getattr(cloud, "stopped", False):
-                            await cloud.start()
-                    except Exception:
-                        pass
-                    # Re-bind callbacks and (re)start map sync if needed
-                    try:
-                        await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
-                    except Exception:
-                        pass
+                    device = mgr.get_device_by_name(mower_name)
+                    cloud = getattr(device, "cloud", None)
+                    if cloud and getattr(cloud, "stopped", False):
+                        await cloud.start()
+                    await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
             except Exception:
                 pass
 
-            # Small delay to avoid racing token propagation, then prime reporting.
+            # Small delay to allow token propagation, then prime reporting again
             try:
                 await asyncio.sleep(1.0)
                 await self._prime_reporting(dev_id, mgr)
             except Exception as ex2:
                 self.logger.debug(f"cloud_relogin: post-login prime failed for '{dev.name}': {ex2}")
 
+            # Flush commands queued during stale session
+            await self._flush_pending_commands(dev_id)
+
         except Exception as ex:
             self.logger.debug(f"cloud_relogin: failed for '{dev.name}': {ex}")
+            # Leave queued commands; they will retry later
+        finally:
+            self._cloud_relogin_in_progress[dev_id] = False
+
+    async def _flush_pending_commands(self, dev_id: int):
+        """
+        Execute queued commands (key, kwargs) after a successful relogin.
+        """
+        pending = self._pending_commands.get(dev_id, [])
+        if not pending:
+            return
+        self.logger.debug(f"Flushing {len(pending)} queued command(s) for dev {dev_id}")
+        # Copy then clear to avoid recursion if a send re-queues
+        to_run = list(pending)
+        self._pending_commands[dev_id] = []
+        for key, kwargs in to_run:
+            try:
+                await self._send_command(dev_id, key, **(kwargs or {}))
+            except Exception as ex:
+                self.logger.debug(f"Queued command '{key}' failed after relogin: {ex}")
 
     # _send_command stripped (movement verbs no sync/map; add sys_status logging)
+    # REPLACE _send_command with this version (same shape, just tighter auth handling)
     async def _send_command(self, dev_id: int, key: str, **kwargs):
         dev = indigo.devices.get(dev_id)
         if not dev:
@@ -1830,29 +1930,30 @@ class Plugin(indigo.PluginBase):
         if not name or not mgr:
             self._set_status(dev_id, "No mower selected")
             return
+
         nosync = {"move_forward", "move_back", "move_left", "move_right"}
-        identity_error = False
+
+        async def _do_send():
+            if kwargs:
+                await mgr.send_command_with_args(name, key, **kwargs)
+            else:
+                await mgr.send_command(name, key)
+
         try:
             device = mgr.get_device_by_name(name)
             sys_status = getattr(getattr(device, "state", None), "report_data", None)
             sys_status = getattr(getattr(sys_status, "dev", None), "sys_status", None)
             self.logger.debug(f"_send_command ctx key={key} sys_status={sys_status} kwargs={kwargs}")
 
-            if kwargs:
-                await mgr.send_command_with_args(name, key, **kwargs)
-            else:
-                await mgr.send_command(name, key)
+            await _do_send()
 
             if key not in nosync:
-                try:
+                with contextlib.suppress(Exception):
                     await mgr.start_sync(name, retry=1)
-                except Exception:
-                    pass
             else:
                 self.logger.debug(f"Skip sync for movement key={key}")
 
             self._set_status(dev_id, f"Command sent: {key}")
-
             refresh_after = {
                 "start_job": 0.6,
                 "cancel_job": 0.6,
@@ -1870,38 +1971,34 @@ class Plugin(indigo.PluginBase):
                     delay=delay,
                     min_interval=(0.8 if key not in nosync else 1.5)
                 )
+            return
 
         except Exception as ex:
-            msg = str(ex)
-            if ("identityId is blank" in msg) or ("29003" in msg):
-                identity_error = True
-                self.logger.warning(
-                    f"Cloud session expired (29003) for '{dev.name}' during '{key}'. Re-login and retry once.")
+            if self._is_auth_error(ex):
+                self.logger.warning(f"Cloud auth expired for '{dev.name}' during '{key}'; re-login and retry once.")
+                # Reflect auth lost briefly
+                self._set_auth(dev_id, False)
+                try:
+                    await self._cloud_relogin_once(dev_id)
+                    await asyncio.sleep(1.0)
+                    # Try again once
+                    await _do_send()
+                    if key not in nosync:
+                        with contextlib.suppress(Exception):
+                            await mgr.start_sync(name, retry=1)
+                    self._set_auth(dev_id, True)
+                    self._set_status(dev_id, f"Command retried: {key}")
+                    self._force_refresh_states(dev_id, delay=0.6)
+                    return
+                except Exception as rex:
+                    self.logger.error(f"Retry failed for '{dev.name}' after re-login: {rex}")
+                    self._set_status(dev_id, f"Command error: {rex}")
+                    return
             else:
+                # Non-auth error: keep existing behavior
                 self._set_status(dev_id, f"Command error: {ex}")
+                return
 
-        if identity_error:
-            # Attempt single re-login then one retry of original command
-            try:
-                await self._cloud_relogin_once(dev_id)
-                await asyncio.sleep(1.0)
-                # Retry same command once
-                self.logger.debug(f"Retrying command '{key}' after re-login for '{dev.name}'")
-                if kwargs:
-                    await mgr.send_command_with_args(name, key, **kwargs)
-                else:
-                    await mgr.send_command(name, key)
-                # Optional sync
-                if key not in nosync:
-                    try:
-                        await mgr.start_sync(name, retry=1)
-                    except Exception:
-                        pass
-                self._set_status(dev_id, f"Command retried: {key}")
-                self._force_refresh_states(dev_id, delay=0.6)
-            except Exception as rex:
-                self.logger.error(f"Retry failed for '{dev.name}' after identity refresh: {rex}")
-                self._set_status(dev_id, f"Command error: {rex}")
 
     ########################################
     # State helpers
@@ -1951,126 +2048,6 @@ class Plugin(indigo.PluginBase):
             pass
 
     # --- Add to your plugin class ---
-
-    def areas_menu(self, filter_str: str = "", values_dict=None, type_id: str = "", target_id: int = 0) -> list:
-        """
-        Dynamic list for Actions.xml (deviceFilter="self"): return (hash, name).
-        - Anti-flicker: falls back to cached items when live list is unavailable.
-        - Never returns an empty list: uses a 'fetching' placeholder and schedules an async fetch.
-        - Resolves dev_id robustly from target_id or values_dict.
-        """
-
-        def _norm_items(pairs):
-            out = []
-            seen = set()
-            for val, label in pairs:
-                try:
-                    sval = str(val).strip()
-                    if not sval:
-                        continue
-                    if sval in seen:
-                        continue
-                    seen.add(sval)
-                    out.append((sval, str(label)))
-                except Exception:
-                    continue
-            try:
-                out.sort(key=lambda t: t[1].lower())
-            except Exception:
-                pass
-            return out
-
-        # 1) Resolve the device id robustly
-        dev_id = 0
-        try:
-            if target_id:
-                dev_id = int(target_id)
-            elif values_dict:
-                for k in ("targetId", "deviceId", "devId", "objectId"):
-                    v = values_dict.get(k)
-                    if v:
-                        try:
-                            dev_id = int(v)
-                            break
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-
-        if not dev_id:
-            # No context; return a stable placeholder
-            return [("no_device", "No device context")]
-
-        # 2) Try live list first
-        live_items = []
-        try:
-            dev = indigo.devices.get(dev_id)
-            mgr = self._mgr.get(dev_id)
-            mower_name = self._mower_name.get(dev_id)
-            if mgr and mower_name:
-                mowing_device = mgr.mower(mower_name)
-                if mowing_device:
-                    m = getattr(mowing_device, "map", None)
-                    names = getattr(m, "area_name", []) if m else []
-                    area_tbl = getattr(m, "area", {}) if m else {}
-
-                    # Primary: area_name list (hash + name)
-                    for an in (names or []):
-                        try:
-                            ah = getattr(an, "hash", None)
-                            if ah in (None, 0, "0", ""):
-                                continue
-                            nm = getattr(an, "name", None) or f"area {ah}"
-                            live_items.append((str(int(ah)), nm))
-                        except Exception:
-                            continue
-
-                    # Fallback: map.area keys
-                    if not live_items and isinstance(area_tbl, dict):
-                        for ah in area_tbl.keys():
-                            try:
-                                if ah in (None, 0, "0", ""):
-                                    continue
-                                live_items.append((str(int(ah)), f"area {ah}"))
-                            except Exception:
-                                continue
-        except Exception:
-            self.logger.exception("areas_menu live build failed")
-
-        live_items = _norm_items(live_items)
-
-        # 3) If we got live items, cache and return them
-        if live_items:
-            try:
-                self._areas_cache[dev_id] = [{"id": v, "name": n} for (v, n) in live_items]
-                self.logger.debug(f"areas_menu: returning LIVE areas ({len(live_items)}) for dev_id={dev_id}")
-            except Exception:
-                pass
-            return live_items
-
-        # 4) Fall back to cache (anti-flicker)
-        cache = self._areas_cache.get(dev_id, []) or []
-        if cache:
-            cached_items = _norm_items([(c.get("id", ""), c.get("name", "")) for c in cache])
-            if cached_items:
-                self.logger.debug(f"areas_menu: returning CACHED areas ({len(cached_items)}) for dev_id={dev_id}")
-                return cached_items
-
-        # 5) Kick async fetch and return placeholder (non-empty id)
-        try:
-            if getattr(self, "_event_loop", None):
-                async def _do_fetch():
-                    try:
-                        await self._fetch_areas(dev_id)
-                    except Exception:
-                        self.logger.debug("areas_menu: _fetch_areas raised", exc_info=True)
-
-                self._event_loop.call_soon_threadsafe(asyncio.create_task, _do_fetch())
-        except Exception:
-            self.logger.debug("areas_menu: scheduling fetch failed", exc_info=True)
-
-        self.logger.debug(f"areas_menu: no live/cache areas; returning placeholder for dev_id={dev_id}")
-        return [("fetching", "Fetching areas...")]
 
     def select_area_action(self, action, dev):
         """
@@ -2841,7 +2818,17 @@ class Plugin(indigo.PluginBase):
         async def _do():
             try:
                 device = mgr.get_device_by_name(mower_name)
-                stream_resp = await device.mammotion_http.get_stream_subscription(device.iot_id)
+                # Try subscription fetch
+                try:
+                    stream_resp = await device.mammotion_http.get_stream_subscription(device.iot_id)
+                except Exception as ex:
+                    if self._is_auth_error(ex):
+                        self.logger.warning("Stream subscription failed due to auth; re-login and retry once")
+                        await self._cloud_relogin_once(dev.id)
+                        await asyncio.sleep(1.0)
+                        stream_resp = await device.mammotion_http.get_stream_subscription(device.iot_id)
+                    else:
+                        raise
                 raw = stream_resp.data.to_dict() if getattr(stream_resp, "data", None) else {}
                 # Log keys we actually got
                 self.logger.debug(f"camera_refresh_stream: raw stream dict keys: {list(raw.keys())}")
