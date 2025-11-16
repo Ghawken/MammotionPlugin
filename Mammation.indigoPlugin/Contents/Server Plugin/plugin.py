@@ -680,6 +680,53 @@ class Plugin(indigo.PluginBase):
     #     self._webrtc_http_started = True
     #     self._event_loop.call_soon_threadsafe(asyncio.create_task, _serve())
 
+    def _is_auth_error(self, ex) -> bool:
+        """
+        Return True if the exception indicates Mammotion cloud auth is invalid/expired.
+        Consolidated: works with explicit code fields, args, and known exception types /
+        messages (parallels HA's EXPIRED_CREDENTIAL_EXCEPTIONS).
+        """
+        try:
+            # direct 'code' attribute
+            code = getattr(ex, "code", None)
+            if isinstance(code, int) and code in (29002, 29003, 460):
+                return True
+
+            # first arg numeric
+            if ex.args and isinstance(ex.args[0], int) and ex.args[0] in (29002, 29003, 460):
+                return True
+
+            # HA-style exceptions: CheckSessionException / SetupException / UnauthorizedException
+            import pymammotion
+            try:
+                from pymammotion.aliyun.cloud_gateway import CheckSessionException, SetupException
+            except Exception:
+                CheckSessionException = SetupException = ()
+            try:
+                from pymammotion.http.model.http import UnauthorizedException
+            except Exception:
+                UnauthorizedException = ()
+            if isinstance(ex, (CheckSessionException, SetupException, UnauthorizedException)):
+                return True
+        except Exception:
+            pass
+
+        s = str(ex) or ""
+        return any(
+            t in s
+            for t in (
+                "identityId is blank",   # 29003 text
+                "iotToken is blank",     # 460 text
+                "code:29003",
+                "code:29002",
+                "code:460",
+                " 29003",
+                " 29002",
+                " 460",
+                "token invalid",
+                "SignatureDoesNotMatch",
+            )
+        )
 
     def shutdown(self):
         self.logger.debug("shutdown called")
@@ -1140,8 +1187,20 @@ class Plugin(indigo.PluginBase):
                     except Exception:
                         pass
                     self._schedule_state_refresh(dev_id)
+                    if hasattr(cloud, "set_error_callback"):
+                        async def _cloud_error(exc):
+                            if self._is_auth_error(exc):
+                                self.logger.warning(
+                                    f"Cloud error (auth) for '{mower_name}', scheduling re-login"
+                                )
+                                self._set_auth(dev_id, False)
+                                try:
+                                    await self._cloud_relogin_once(dev_id)
+                                except Exception as re:
+                                    self.logger.debug(f"_cloud_error: relogin failed for '{mower_name}': {re}")
 
-                cloud.set_notification_callback(_cloud_notify)
+                        cloud.set_error_callback(self._async_wrap(_cloud_error))
+
             else:
                 self.logger.debug("cloud.set_notification_callback not available on this build")
         except Exception as ex:
@@ -1762,10 +1821,13 @@ class Plugin(indigo.PluginBase):
             self._set_status(dev_id, "Poll error")
             self.logger.exception("_refresh_states top-level failure")
 
+    # inside Plugin class
     async def _cloud_relogin_once(self, dev_id: int, min_interval: float = 60.0) -> None:
         """
-        Re-login current Mammotion manager for this Indigo device if cooldown elapsed.
-        Quietly returns if account/password missing or already attempted recently.
+        Re-login / refresh Mammotion cloud session for this Indigo device.
+        Prefer the CloudIOTGateway.check_or_refresh_session() (HA-style),
+        fall back to Mammotion.login_and_initiate_cloud() only if necessary.
+        Debounced via min_interval and a per-dev in-progress flag.
         """
         import time
         now = time.monotonic()
@@ -1774,54 +1836,82 @@ class Plugin(indigo.PluginBase):
             return
         self._last_cloud_relogin[dev_id] = now
 
+        if self._cloud_relogin_in_progress.get(dev_id, False):
+            return
+        self._cloud_relogin_in_progress[dev_id] = True
+
         dev = indigo.devices.get(dev_id)
         mgr = self._mgr.get(dev_id)
         if not dev or not mgr:
+            self._cloud_relogin_in_progress[dev_id] = False
             return
+
         props = dev.pluginProps or {}
         account = (props.get("account") or "").strip()
         password = (props.get("password") or "").strip()
         if not account or not password:
             self.logger.debug(f"cloud_relogin: missing credentials for dev {dev_id}")
+            self._cloud_relogin_in_progress[dev_id] = False
             return
 
         try:
-            self.logger.debug(f"cloud_relogin: attempting re-login for '{dev.name}'")
-            await mgr.login_and_initiate_cloud(account, password)
-            self.logger.debug(f"cloud_relogin: success for '{dev.name}'")
+            self.logger.debug(f"cloud_relogin: attempting refresh for '{dev.name}'")
 
-            # Re-enable per-device cloud transport and re-prime telemetry for the selected mower.
+            # 1. Try the per-device cloud_client first, HA style
+            cloud_refreshed = False
+            try:
+                mower_name = self._mower_name.get(dev_id)
+                device = mgr.get_device_by_name(mower_name) if mower_name else None
+                cloud_client = getattr(device, "cloud_client", None)
+                if cloud_client and hasattr(cloud_client, "check_or_refresh_session"):
+                    await cloud_client.check_or_refresh_session()
+                    cloud_refreshed = True
+                    self.logger.debug(f"cloud_relogin: cloud_client.check_or_refresh_session() OK for '{dev.name}'")
+            except Exception as ex:
+                self.logger.debug(f"cloud_relogin: cloud_client refresh failed for '{dev.name}': {ex}")
+
+            # 2. Fallback to full login if gateway refresh not possible or failed
+            if not cloud_refreshed:
+                self.logger.debug(f"cloud_relogin: falling back to login_and_initiate_cloud for '{dev.name}'")
+                await mgr.login_and_initiate_cloud(account, password)
+
+            # 3. Re-enable cloud + callbacks + telemetry (same as before)
             try:
                 mower_name = self._mower_name.get(dev_id)
                 if mower_name:
-                    # Ensure cloud transport is running
-                    try:
-                        device = mgr.get_device_by_name(mower_name)
-                        cloud = getattr(device, "cloud", None)
-                        if cloud and getattr(cloud, "stopped", False):
-                            await cloud.start()
-                    except Exception:
-                        pass
-                    # Re-bind callbacks and (re)start map sync if needed
-                    try:
-                        await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    device = mgr.get_device_by_name(mower_name)
+                    cloud = getattr(device, "cloud", None)
+                    if cloud and getattr(cloud, "stopped", False):
+                        await cloud.start()
+                    await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
+            except Exception as ex2:
+                self.logger.debug(f"cloud_relogin: re-bind failed for '{dev.name}': {ex2}")
 
-            # Small delay to avoid racing token propagation, then prime reporting.
             try:
                 await asyncio.sleep(1.0)
                 await self._prime_reporting(dev_id, mgr)
             except Exception as ex2:
                 self.logger.debug(f"cloud_relogin: post-login prime failed for '{dev.name}': {ex2}")
 
+            await self._flush_pending_commands(dev_id)
+            # Mark auth as good again
+            self._set_auth(dev_id, True)
+
         except Exception as ex:
             self.logger.debug(f"cloud_relogin: failed for '{dev.name}': {ex}")
+            # do not clear pending commands; they can retry on next success
+        finally:
+            self._cloud_relogin_in_progress[dev_id] = False
 
     # _send_command stripped (movement verbs no sync/map; add sys_status logging)
+    # inside Plugin class
     async def _send_command(self, dev_id: int, key: str, **kwargs):
+        """
+        Central command dispatcher (coordinator-like):
+        - Sends Mammotion commands via the current manager.
+        - On auth error, triggers cloud refresh and retries once.
+        - Uses _pending_commands if a relogin is already in progress.
+        """
         dev = indigo.devices.get(dev_id)
         if not dev:
             return
@@ -1830,24 +1920,28 @@ class Plugin(indigo.PluginBase):
         if not name or not mgr:
             self._set_status(dev_id, "No mower selected")
             return
+
+        import contextlib
+
         nosync = {"move_forward", "move_back", "move_left", "move_right"}
-        identity_error = False
+
+        async def _do_send():
+            if kwargs:
+                await mgr.send_command_with_args(name, key, **kwargs)
+            else:
+                await mgr.send_command(name, key)
+
         try:
             device = mgr.get_device_by_name(name)
             sys_status = getattr(getattr(device, "state", None), "report_data", None)
             sys_status = getattr(getattr(sys_status, "dev", None), "sys_status", None)
             self.logger.debug(f"_send_command ctx key={key} sys_status={sys_status} kwargs={kwargs}")
 
-            if kwargs:
-                await mgr.send_command_with_args(name, key, **kwargs)
-            else:
-                await mgr.send_command(name, key)
+            await _do_send()
 
             if key not in nosync:
-                try:
+                with contextlib.suppress(Exception):
                     await mgr.start_sync(name, retry=1)
-                except Exception:
-                    pass
             else:
                 self.logger.debug(f"Skip sync for movement key={key}")
 
@@ -1868,40 +1962,46 @@ class Plugin(indigo.PluginBase):
                 self._force_refresh_states(
                     dev_id,
                     delay=delay,
-                    min_interval=(0.8 if key not in nosync else 1.5)
+                    min_interval=(0.8 if key not in nosync else 1.5),
                 )
+            return
 
         except Exception as ex:
-            msg = str(ex)
-            if ("identityId is blank" in msg) or ("29003" in msg):
-                identity_error = True
-                self.logger.warning(
-                    f"Cloud session expired (29003) for '{dev.name}' during '{key}'. Re-login and retry once.")
-            else:
-                self._set_status(dev_id, f"Command error: {ex}")
+            # 1. If we are already doing a relogin, queue the command
+            if self._cloud_relogin_in_progress.get(dev_id, False) and self._is_auth_error(ex):
+                self.logger.debug(
+                    f"_send_command: auth error during relogin, queuing '{key}' for dev {dev_id}: {ex}"
+                )
+                self._pending_commands.setdefault(dev_id, []).append((key, dict(kwargs)))
+                self._set_auth(dev_id, False)
+                self._set_status(dev_id, f"Queued command (auth refresh): {key}")
+                return
 
-        if identity_error:
-            # Attempt single re-login then one retry of original command
-            try:
-                await self._cloud_relogin_once(dev_id)
-                await asyncio.sleep(1.0)
-                # Retry same command once
-                self.logger.debug(f"Retrying command '{key}' after re-login for '{dev.name}'")
-                if kwargs:
-                    await mgr.send_command_with_args(name, key, **kwargs)
-                else:
-                    await mgr.send_command(name, key)
-                # Optional sync
-                if key not in nosync:
-                    try:
-                        await mgr.start_sync(name, retry=1)
-                    except Exception:
-                        pass
-                self._set_status(dev_id, f"Command retried: {key}")
-                self._force_refresh_states(dev_id, delay=0.6)
-            except Exception as rex:
-                self.logger.error(f"Retry failed for '{dev.name}' after identity refresh: {rex}")
-                self._set_status(dev_id, f"Command error: {rex}")
+            # 2. New auth error => try relogin once then retry
+            if self._is_auth_error(ex):
+                self.logger.warning(
+                    f"Cloud auth expired for '{dev.name}' during '{key}'; re-login and retry once."
+                )
+                self._set_auth(dev_id, False)
+                try:
+                    await self._cloud_relogin_once(dev_id)
+                    await asyncio.sleep(1.0)
+                    await _do_send()
+                    if key not in nosync:
+                        with contextlib.suppress(Exception):
+                            await mgr.start_sync(name, retry=1)
+                    self._set_auth(dev_id, True)
+                    self._set_status(dev_id, f"Command retried: {key}")
+                    self._force_refresh_states(dev_id, delay=0.6)
+                    return
+                except Exception as rex:
+                    self.logger.error(f"Retry failed for '{dev.name}' after re-login: {rex}")
+                    self._set_status(dev_id, f"Command error: {rex}")
+                    return
+
+            # 3. Non-auth error: maintain existing behaviour
+            self._set_status(dev_id, f"Command error: {ex}")
+            return
 
     ########################################
     # State helpers
