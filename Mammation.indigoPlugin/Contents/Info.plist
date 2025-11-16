@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>PluginVersion</key>
-    <string>2025.1.55</string>
+    <string>2025.1.65</string>
     <key>ServerApiVersion</key>
     <string>3.6</string>
     <key>CFBundleDisplayName</key>

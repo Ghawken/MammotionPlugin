@@ -129,17 +129,6 @@ class Plugin(indigo.PluginBase):
             indigo.server.log(f"Failed to create IndigoLogHandler: {exc}", isError=True)
 
         try:
-            #logs_dir = path.join(indigo.server.getInstallFolderPath(), "Logs", "Plugins", self.plugin_id)
-            #os.makedirs(logs_dir, exist_ok=True)
-            #logfile = path.join(logs_dir, f"{plugin_id}.log")
-            #if getattr(self, "plugin_file_handler", None):
-            #    self.logger.removeHandler(self.plugin_file_handler)
-            #self.plugin_file_handler = logging.handlers.RotatingFileHandler(logfile, maxBytes=2_000_000, backupCount=3)
-            #pfmt = logging.Formatter(
-            #    "%(asctime)s.%(msecs)03d\t[%(levelname)8s] %(name)20s.%(funcName)-25s%(message)s",
-            #    datefmt="%Y-%m-%d %H:%M:%S",
-            #)
-            #self.plugin_file_handler.setFormatter(pfmt)
             self.plugin_file_handler.setLevel(self.fileloglevel)
             self.logger.addHandler(self.plugin_file_handler)
         except Exception as exc:
@@ -187,6 +176,7 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"Library logging attach failed: {exc}")
 
         logging.getLogger("pymammotion").addHandler(self.plugin_file_handler)
+
 
         self.logger.info("{0:=^120}".format(" End Initializing "))
 
@@ -263,6 +253,77 @@ class Plugin(indigo.PluginBase):
             self.logger.info("Entered remote manual control mode")
         except Exception as ex:
             self.logger.error(f"Enter manual control failed: {ex}")
+
+    async def _rebootstrap_cloud_for_device(self, dev_id: int) -> None:
+        """
+        Hard reset of Mammotion cloud for this Indigo device:
+        - Re-run login_and_initiate_cloud() on a fresh Mammotion instance
+        - Re-resolve mower name and re-attach manager/device for this dev_id
+        Used when refreshToken is invalid (another device logged in).
+        """
+        dev = indigo.devices.get(dev_id)
+        if not dev:
+            return
+
+        props = dev.pluginProps or {}
+        account = (props.get("account") or "").strip()
+        password = (props.get("password") or "").strip()
+        name_hint = (props.get("deviceName") or "").strip()
+
+        if not account or not password:
+            self.logger.debug(f"rebootstrap: missing credentials for dev {dev_id}")
+            return
+
+        self.logger.debug(f"rebootstrap: creating fresh Mammotion manager for '{dev.name}'")
+
+        # Drop any previous manager mapping for this dev_id
+        old_mgr = self._mgr.pop(dev_id, None)
+        try:
+            # Best effort: if old_mgr has a close/stop, call it; otherwise skip
+            close = getattr(old_mgr, "close", None)
+            if callable(close):
+                await close()
+        except Exception:
+            pass
+
+        # New manager and login
+        mgr = Mammotion()
+        await mgr.login_and_initiate_cloud(account, password)
+        self._mgr[dev_id] = mgr
+
+        # Resolve mower name again
+        mower_name = await self._resolve_mower_name(mgr, name_hint)
+        if not mower_name:
+            self._set_status(dev_id, "No mower found after rebootstrap")
+            raise RuntimeError("No mower found after rebootstrap")
+        self._mower_name[dev_id] = mower_name
+        self.logger.info(
+            f"'{dev.name}' reconnected after auth reset. Controlling mower name: {mower_name}"
+        )
+
+        # Cache userAccount like initial login
+        try:
+            device = mgr.get_device_by_name(mower_name)
+            account_id = None
+            if device and getattr(device, "mammotion_http", None):
+                http_resp = getattr(device.mammotion_http, "response", None)
+                if http_resp and getattr(http_resp, "data", None) and getattr(
+                    http_resp.data, "userInformation", None
+                ):
+                    ua = getattr(http_resp.data.userInformation, "userAccount", None)
+                    if ua is not None:
+                        account_id = int(ua)
+            self._user_account_id[dev_id] = account_id
+        except Exception as ex:
+            self._user_account_id[dev_id] = None
+            self.logger.debug(f"rebootstrap: reading userAccount failed: {ex}")
+
+        # Re-enable cloud and telemetry
+        await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
+        await self._prime_reporting(dev_id, mgr)
+        self._set_connected(dev_id, True)
+        self._set_auth(dev_id, True)
+        self._set_status(dev_id, "Reconnected after auth reset")
 
     async def _flush_pending_commands(self, dev_id: int) -> None:
         """
@@ -876,6 +937,7 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:
                 self.logger.debug(f"Pref logging update failed: {exc}")
 
+
         except Exception as exc:
             self.logger.exception(exc)
 
@@ -1116,8 +1178,8 @@ class Plugin(indigo.PluginBase):
             await mgr.send_command(name, "get_report_cfg")
             try:
                 from pymammotion.proto import RptAct, RptInfoType
-                await mgr.send_command_with_args(
-                    name,
+                await self._send_command(
+                    dev_id,
                     "request_iot_sys",
                     rpt_act=RptAct.RPT_START,
                     rpt_info_type=[
@@ -1135,8 +1197,8 @@ class Plugin(indigo.PluginBase):
                 )
             except Exception as ex:
                 self.logger.debug(f"request_iot_sys enums failed, trying minimal start: {ex}")
-                await mgr.send_command_with_args(
-                    name,
+                await self._send_command(
+                    dev_id,
                     "request_iot_sys",
                     timeout=10000,
                     period=3000,
@@ -1268,15 +1330,15 @@ class Plugin(indigo.PluginBase):
                     self._last_area_req[dev_id] = now
                     self.logger.debug(f"Requesting area name list for '{mower_name}' (cooldown ok)")
                     try:
-                        # Preferred signature
-                        await mgr.send_command_with_args("get_area_name_list", device_id=device.iot_id)
-                    except Exception:
-                        # Fallback signature
+                        # Prefer passing explicit device_id (if the cloud layer uses it)
+                        await self._send_command(dev_id, "get_area_name_list", device_id=device.iot_id)
+                    except Exception as ex1:
+                        self.logger.debug(f"get_area_name_list with device_id failed: {ex1}")
                         try:
-                            await mgr.send_command(mower_name, "get_area_name_list")
+                            # Fallback: basic signature
+                            await self._send_command(dev_id, "get_area_name_list")
                         except Exception as ex2:
-                            self.logger.debug(f"get_area_name_list failed: {ex2}")
-                else:
+                            self.logger.debug(f"get_area_name_list fallback failed: {ex2}")
                     self.logger.debug(
                         f"Skipping get_area_name_list for '{mower_name}' (cooldown {(AREA_REQ_COOLDOWN_SEC - int(now - last))}s left)")
             else:
@@ -1304,7 +1366,7 @@ class Plugin(indigo.PluginBase):
                         mgr = self._mgr.get(dev_id)
                         name = self._mower_name.get(dev_id)
                         if mgr and name:
-                            await mgr.send_command(name, "get_report_cfg")
+                            await self._send_command(dev_id, "get_report_cfg")
                     except Exception:
                         pass
 
@@ -1850,11 +1912,26 @@ class Plugin(indigo.PluginBase):
     async def _cloud_relogin_once(self, dev_id: int, min_interval: float = 60.0) -> None:
         """
         Re-login / refresh Mammotion cloud session for this Indigo device.
-        Prefer the CloudIOTGateway.check_or_refresh_session() (HA-style),
-        fall back to Mammotion.login_and_initiate_cloud() only if necessary.
+
+        Strategy:
+          1. Try CloudIOTGateway.check_or_refresh_session() (soft refresh, HA-style).
+          2. If that fails, use Mammotion.refresh_login(account) on the existing manager
+             (library's intended re-auth + reconnect path).
+          3. If the error looks like a hard 2401 "refreshToken invalid" and refresh_login
+             also fails, fall back to a full rebootstrap (new Mammotion manager +
+             login_and_initiate_cloud) via _rebootstrap_cloud_for_device.
         Debounced via min_interval and a per-dev in-progress flag.
         """
         import time
+
+        # Defensive init (in case of live upgrade)
+        if not hasattr(self, "_last_cloud_relogin"):
+            self._last_cloud_relogin = {}
+        if not hasattr(self, "_cloud_relogin_in_progress"):
+            self._cloud_relogin_in_progress = {}
+        if not hasattr(self, "_pending_commands"):
+            self._pending_commands = {}
+
         now = time.monotonic()
         last = self._last_cloud_relogin.get(dev_id, 0.0)
         if (now - last) < min_interval:
@@ -1882,8 +1959,10 @@ class Plugin(indigo.PluginBase):
         try:
             self.logger.debug(f"cloud_relogin: attempting refresh for '{dev.name}'")
 
-            # 1. Try the per-device cloud_client first, HA style
             cloud_refreshed = False
+            refresh_error = None
+
+            # 1. Try the per-device cloud_client first (HA-style soft refresh)
             try:
                 mower_name = self._mower_name.get(dev_id)
                 device = mgr.get_device_by_name(mower_name) if mower_name else None
@@ -1891,40 +1970,94 @@ class Plugin(indigo.PluginBase):
                 if cloud_client and hasattr(cloud_client, "check_or_refresh_session"):
                     await cloud_client.check_or_refresh_session()
                     cloud_refreshed = True
-                    self.logger.debug(f"cloud_relogin: cloud_client.check_or_refresh_session() OK for '{dev.name}'")
+                    self.logger.debug(
+                        f"cloud_relogin: cloud_client.check_or_refresh_session() OK for '{dev.name}'"
+                    )
             except Exception as ex:
-                self.logger.debug(f"cloud_relogin: cloud_client refresh failed for '{dev.name}': {ex}")
+                refresh_error = ex
+                self.logger.debug(
+                    f"cloud_relogin: cloud_client refresh failed for '{dev.name}': {ex}"
+                )
 
-            # 2. Fallback to full login if gateway refresh not possible or failed
+            # 2. If refresh failed, decide fallback path
             if not cloud_refreshed:
-                self.logger.debug(f"cloud_relogin: falling back to login_and_initiate_cloud for '{dev.name}'")
-                await mgr.login_and_initiate_cloud(account, password)
+                err_text = str(refresh_error) if refresh_error else ""
 
-            # 3. Re-enable cloud + callbacks + telemetry (same as before)
+                # Detect the "refreshToken invalid" (code 2401) case
+                is_refresh_token_bad = (
+                    "refreshToken invalid" in err_text
+                    or "'code': 2401" in err_text
+                    or "\"code\": 2401" in err_text
+                )
+
+                # First, try the library's account-level refresh_login on the existing manager
+                used_refresh_login = False
+                try:
+                    self.logger.debug(
+                        f"cloud_relogin: falling back to Mammotion.refresh_login(account) for '{dev.name}'"
+                    )
+                    await mgr.refresh_login(account)
+                    used_refresh_login = True
+                except Exception as ex2:
+                    self.logger.debug(
+                        f"cloud_relogin: refresh_login failed for '{dev.name}': {ex2}"
+                    )
+
+                # If refresh_login didn't succeed AND looks like a hard 2401, do full rebootstrap
+                if is_refresh_token_bad and not used_refresh_login:
+                    self.logger.debug(
+                        f"cloud_relogin: refresh token invalid for '{dev.name}', "
+                        f"performing full cloud rebootstrap"
+                    )
+                    await self._rebootstrap_cloud_for_device(dev_id)
+                    # After rebootstrap, mgr may have changed
+                    mgr = self._mgr.get(dev_id)
+                elif not used_refresh_login and not is_refresh_token_bad:
+                    # Non-2401 failure and refresh_login failed: last resort fallback
+                    self.logger.debug(
+                        f"cloud_relogin: falling back to login_and_initiate_cloud for '{dev.name}'"
+                    )
+                    await mgr.login_and_initiate_cloud(account, password)
+
+                # Re-enable cloud + callbacks + telemetry on the current manager
+                try:
+                    mower_name = self._mower_name.get(dev_id)
+                    if mower_name and mgr:
+                        device = mgr.get_device_by_name(mower_name)
+                        cloud = getattr(device, "cloud", None)
+                        if cloud and getattr(cloud, "stopped", False):
+                            await cloud.start()
+                        await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
+                except Exception as ex2:
+                    self.logger.debug(
+                        f"cloud_relogin: re-bind failed for '{dev.name}': {ex2}"
+                    )
+
+                try:
+                    await asyncio.sleep(1.0)
+                    if mgr:
+                        await self._prime_reporting(dev_id, mgr)
+                except Exception as ex2:
+                    self.logger.debug(
+                        f"cloud_relogin: post-login prime failed for '{dev.name}': {ex2}"
+                    )
+
+            # 3. Flush queued commands if any
             try:
-                mower_name = self._mower_name.get(dev_id)
-                if mower_name:
-                    device = mgr.get_device_by_name(mower_name)
-                    cloud = getattr(device, "cloud", None)
-                    if cloud and getattr(cloud, "stopped", False):
-                        await cloud.start()
-                    await self._enable_cloud_and_bind(dev_id, mgr, mower_name)
+                flush = getattr(self, "_flush_pending_commands", None)
+                if flush is not None:
+                    await flush(dev_id)
             except Exception as ex2:
-                self.logger.debug(f"cloud_relogin: re-bind failed for '{dev.name}': {ex2}")
+                self.logger.debug(
+                    f"cloud_relogin: flush_pending_commands failed for '{dev.name}': {ex2}"
+                )
 
-            try:
-                await asyncio.sleep(1.0)
-                await self._prime_reporting(dev_id, mgr)
-            except Exception as ex2:
-                self.logger.debug(f"cloud_relogin: post-login prime failed for '{dev.name}': {ex2}")
-
-            await self._flush_pending_commands(dev_id)
             # Mark auth as good again
             self._set_auth(dev_id, True)
 
         except Exception as ex:
             self.logger.debug(f"cloud_relogin: failed for '{dev.name}': {ex}")
-            # do not clear pending commands; they can retry on next success
+            # pending commands remain queued
         finally:
             self._cloud_relogin_in_progress[dev_id] = False
 
@@ -2283,21 +2416,21 @@ class Plugin(indigo.PluginBase):
                 self.logger.error(f"Refresh Area List: manager or mower not ready for '{dev.name}'")
                 return
 
-            # Best-effort: kick map sync and get_area_name_list
             async def _do():
                 try:
                     await mgr.start_map_sync(mower_name)
                 except Exception:
                     self.logger.debug("start_map_sync failed or not available", exc_info=True)
                 try:
-                    # Prefer by args if available (needs iot_id)
                     device = mgr.get_device_by_name(mower_name)
                     if device:
-                        await mgr.send_command_with_args("get_area_name_list", device_id=device.iot_id)
+                        # Prefer explicit device_id, via coordinator
+                        await self._send_command(dev.id, "get_area_name_list", device_id=device.iot_id)
                     else:
-                        await mgr.send_command(mower_name, "get_area_name_list")
+                        await self._send_command(dev.id, "get_area_name_list")
                 except Exception:
                     self.logger.debug("get_area_name_list send failed", exc_info=True)
+
 
             # Schedule on your loop if present
             if getattr(self, "_event_loop", None):

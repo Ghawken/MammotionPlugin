@@ -34,6 +34,6 @@
 
     <Field id="debugLibrary" type="checkbox" defaultValue="false">
         <Label>Enable PyMammotion library debug</Label>
-        <Description>Route PyMammotion DEBUG logs to Indigo Event Log and plugin file log</Description>
+        <Description>Route PyMammotion DEBUG logs to Indigo Event Log and plugin file log (file only)</Description>
     </Field>
 </PluginConfig>
