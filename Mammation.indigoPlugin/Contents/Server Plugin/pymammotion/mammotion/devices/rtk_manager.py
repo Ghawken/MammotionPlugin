@@ -1,15 +1,18 @@
 """RTK Device Manager - manages RTK devices with cloud and BLE connectivity."""
 
-try:  # Py3.12+
-    from typing import override  # type: ignore[attr-defined]
-except Exception:  # Py3.11 and below
-    try:
-        from typing_extensions import override  # type: ignore
-    except Exception:
-        # Last-resort runtime no-op; still fine for production
-        def override(func):
-            return func
+from typing import Any, Callable, TypeVar
 
+_T = TypeVar("_T", bound=Callable[..., Any])
+
+try:
+    from typing import override as typing_override  # type: ignore[attr-defined]
+
+    def override(func: _T) -> _T:
+        return typing_override(func)  # type: ignore[misc]
+except Exception:
+    def override(func: _T) -> _T:
+        """Compatibility shim for Python < 3.12; runtime no-op."""
+        return func
 
 from bleak import BLEDevice
 

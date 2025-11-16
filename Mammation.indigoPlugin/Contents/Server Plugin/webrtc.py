@@ -14,7 +14,15 @@ except ImportError:
     indigo = None
 
 import asyncio
+from aiohttp import web
+import asyncio
+import json
+import indigo
+import logging
 
+#logger = logging.getLogger("Plugin.MammationWEBRTC")
+
+### webrtc
 
 def start_webrtc_http(plugin):
     """
@@ -47,6 +55,304 @@ def start_webrtc_http(plugin):
             def _json_error(msg, status=400):
                 return web.json_response({"ok": False, "error": str(msg)}, status=status)
 
+        ### Mapping
+            ### Mapping
+
+            async def _get_device_and_mgr(dev_id: int):
+                """
+                Return (indigo_dev, mgr, mower_name, mowing_device) for the given Indigo device id.
+                All items can be None if not available.
+                """
+                dev = None
+                mgr = None
+                mower_name = None
+                mowing_device = None
+                try:
+                    dev = indigo.devices.get(dev_id)
+                except Exception:
+                    dev = None
+
+                try:
+                    mgr = plugin._mgr.get(dev_id)
+                except Exception:
+                    mgr = None
+
+                try:
+                    mower_name = plugin._mower_name.get(dev_id)
+                except Exception:
+                    mower_name = None
+
+                if mgr and mower_name:
+                    try:
+                        mowing_device = mgr.mower(mower_name)
+                    except Exception:
+                        mowing_device = None
+
+                return dev, mgr, mower_name, mowing_device
+
+            async def map_page_trivial(request: web.Request) -> web.Response:
+                """Simple debug page to prove mapping server works."""
+                try:
+                    dev_id = request.match_info.get("dev_id", "unknown")
+                except Exception:
+                    dev_id = "bad"
+
+                plugin.logger.debug(f"map_page_trivial: building HTML for dev_id={dev_id}")
+                html = f"<!doctype html><html><body><h1>Map page {dev_id}</h1></body></html>"
+                return web.Response(text=html, content_type="text/html")
+
+            async def map_page(request: web.Request) -> web.Response:
+                """Leaflet map page that calls the GeoJSON endpoints."""
+                try:
+                    dev_id = int(request.match_info.get("dev_id", "0"))
+                except Exception:
+                    dev_id = 0
+                plugin.logger.debug(f"map_page called for dev_id={dev_id}")
+
+                # NOTE: all { } for JS/CSS are doubled {{ }}; only {dev_id} is formatted.
+                html = """<!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8"/>
+          <title>Mammotion Map – {dev_id}</title>
+          <meta name="viewport" content="width=device-width,initial-scale=1"/>
+          <link
+            rel="stylesheet"
+            href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+            crossorigin=""
+          />
+          <style>
+            html,body {{ margin:0; padding:0; height:100%; }}
+            #map {{ width:100%; height:100%; }}
+            .leaflet-container {{ background:#111; }}
+            .mammotion-label span {{
+              background: rgba(0,0,0,0.6);
+              color: #fff;
+              padding: 2px 4px;
+              border-radius: 3px;
+              font-size: 11px;
+              white-space: nowrap;
+            }}
+          </style>
+        </head>
+        <body>
+          <div id="map"></div>
+          <script
+            src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            crossorigin=""
+          ></script>
+      <script>
+        const devId = {dev_id};
+    
+        const map = L.map('map', {{
+          center: [0, 0],
+          zoom: 18,
+          zoomControl: true,
+        }});
+    
+        L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+          maxZoom: 22,
+          attribution: '&copy; OpenStreetMap contributors'
+        }}).addTo(map);
+    
+        function styleFromProps(props) {{
+          const base = {{
+            color: props.color || '#00ff00',
+            weight: props.weight || 2,
+            opacity: props.opacity ?? 0.9,
+            fillOpacity: props.fillOpacity ?? 0.2
+          }};
+          if (props.type_name === 'mow_path') {{
+            base.color = props.color || '#ffcc00';
+            base.weight = props.weight || 2;
+          }}
+          return base;
+        }}
+    
+        // Compute polygon centroid in [lat, lon] for labelling
+        function polygonCentroid(latlngs) {{
+          let x = 0, y = 0, z = 0;
+          const n = latlngs.length;
+          if (!n) return null;
+          latlngs.forEach(ll => {{
+            const lat = ll.lat * Math.PI / 180;
+            const lon = ll.lng * Math.PI / 180;
+            x += Math.cos(lat) * Math.cos(lon);
+            y += Math.cos(lat) * Math.sin(lon);
+            z += Math.sin(lat);
+          }});
+          x /= n; y /= n; z /= n;
+          const lon = Math.atan2(y, x);
+          const hyp = Math.sqrt(x * x + y * y);
+          const lat = Math.atan2(z, hyp);
+          return L.latLng(lat * 180 / Math.PI, lon * 180 / Math.PI);
+        }}
+    
+        function addLabelForFeature(feature, layer) {{
+          const props = feature.properties || {{}};
+          const labelText = props.title || props.Name || '';
+          if (!labelText) return;
+    
+          let labelLatLng = null;
+    
+          if (layer instanceof L.Marker || layer instanceof L.CircleMarker) {{
+            labelLatLng = layer.getLatLng();
+          }} else if (layer instanceof L.Polygon || layer instanceof L.Polyline) {{
+            const latlngs = layer.getLatLngs();
+            let ring = latlngs;
+            if (Array.isArray(latlngs[0])) {{
+              ring = latlngs[0]; // outer ring
+            }}
+            labelLatLng = polygonCentroid(ring);
+          }}
+    
+          if (!labelLatLng) return;
+    
+          const label = L.marker(labelLatLng, {{
+            interactive: false,
+            icon: L.divIcon({{
+              className: 'mammotion-label',
+              html: `<span>${{labelText}}</span>`,
+              iconSize: [0, 0]
+            }})
+          }});
+          label.addTo(map);
+        }}
+    
+        function addGeoJson(url, fit) {{
+          return fetch(url)
+            .then(r => r.json())
+            .then(data => {{
+              if (!data || data.ok === false) {{
+                console.warn('GeoJSON error', data);
+                return null;
+              }}
+              const layer = L.geoJSON(data, {{
+                style: f => styleFromProps(f.properties || {{}}),
+                pointToLayer: (feature, latlng) => {{
+                  const props = feature.properties || {{}};
+                  return L.circleMarker(latlng, styleFromProps(props));
+                }},
+                onEachFeature: (feature, layer) => {{
+                  addLabelForFeature(feature, layer);
+                }}
+              }}).addTo(map);
+              if (fit && layer && layer.getBounds && layer.getBounds().isValid()) {{
+                map.fitBounds(layer.getBounds().pad(0.1), {{ maxZoom: 20 }});
+              }}
+              return layer;
+            }})
+            .catch(err => console.error('GeoJSON fetch failed', err));
+        }}
+    
+        Promise.all([
+          addGeoJson(`/map/${{devId}}/geojson`, true),
+          addGeoJson(`/map/${{devId}}/mowpath`, false),
+        ]);
+      </script>
+        </body>
+        </html>
+        """.format(dev_id=dev_id)
+
+                return web.Response(text=html, content_type="text/html")
+
+            async def map_geojson(request: web.Request) -> web.Response:
+                """
+                Full map GeoJSON using latest PyMammotion:
+                MowerStateManager.generate_geojson(rtk, dock).
+                """
+                try:
+                    dev_id = int(request.match_info["dev_id"])
+                except Exception:
+                    return _json_error("invalid dev_id", 400)
+
+                plugin.logger.debug(f"map_geojson: called for dev_id={dev_id}")
+
+                try:
+                    from pymammotion.data.mower_state_manager import MowerStateManager
+                except Exception as ex:
+                    plugin.logger.error(f"map_geojson: MowerStateManager import failed: {ex}")
+                    return _json_error("MowerStateManager not available", 500)
+
+                dev, mgr, mower_name, mowing_device = await _get_device_and_mgr(dev_id)
+                if not dev or not mgr or not mower_name or not mowing_device:
+                    return _json_error("device not ready", 404)
+
+                try:
+                    location = getattr(mowing_device, "location", None)
+                    rtk = getattr(location, "RTK", None)
+                    dock = getattr(location, "dock", None)
+                    if not (rtk and dock):
+                        return _json_error("RTK/dock data not available yet", 503)
+
+                    state_mgr = getattr(mowing_device, "state_manager", None)
+                    if not isinstance(state_mgr, MowerStateManager):
+                        plugin.logger.debug("map_geojson: creating MowerStateManager for mowing_device")
+                        state_mgr = MowerStateManager(mowing_device)
+                        setattr(mowing_device, "state_manager", state_mgr)
+
+                    geo = state_mgr.generate_geojson(rtk, dock)
+                    return web.json_response(geo)
+                except Exception as ex:
+                    plugin.logger.error(f"map_geojson failed for dev_id={dev_id}: {ex}")
+                    return _json_error(str(ex), 500)
+
+            async def map_mowpath(request: web.Request) -> web.Response:
+                """
+                Mowing path GeoJSON using MowerStateManager.generate_mowing_geojson(rtk).
+                """
+                try:
+                    dev_id = int(request.match_info["dev_id"])
+                except Exception:
+                    return _json_error("invalid dev_id", 400)
+
+                plugin.logger.debug(f"map_mowpath: called for dev_id={dev_id}")
+
+                try:
+                    from pymammotion.data.mower_state_manager import MowerStateManager
+                except Exception as ex:
+                    plugin.logger.error(f"map_mowpath: MowerStateManager import failed: {ex}")
+                    return _json_error("MowerStateManager not available", 500)
+
+                dev, mgr, mower_name, mowing_device = await _get_device_and_mgr(dev_id)
+                if not dev or not mgr or not mower_name or not mowing_device:
+                    return _json_error("device not ready", 404)
+
+                try:
+                    location = getattr(mowing_device, "location", None)
+                    rtk = getattr(location, "RTK", None)
+                    if not rtk:
+                        return _json_error("RTK data not available yet", 503)
+
+                    # Debug: inspect map + mow-path-related fields
+                    map_obj = getattr(mowing_device, "map", None)
+                    if not map_obj:
+                        plugin.logger.debug("map_mowpath: mowing_device.map is None")
+                    else:
+                        # These names mirror upstream HashList attributes; some may not exist
+                        for attr in (
+                            "generated_mow_path_geojson",
+                            "current_mow_path",
+                            "current_mow_path_index",
+                            "current_mow_path_finish",
+                        ):
+                            val = getattr(map_obj, attr, None)
+                            plugin.logger.debug(f"map_mowpath: map.{attr} = {val!r}")
+
+                    state_mgr = getattr(mowing_device, "state_manager", None)
+                    if not isinstance(state_mgr, MowerStateManager):
+                        plugin.logger.debug("map_mowpath: creating MowerStateManager for mowing_device")
+                        state_mgr = MowerStateManager(mowing_device)
+                        setattr(mowing_device, "state_manager", state_mgr)
+
+                    geo = state_mgr.generate_mowing_geojson(rtk)
+                    plugin.logger.debug(f"map_mowpath: generated geojson features={len(geo.get('features', []))}")
+                    return web.json_response(geo)
+                except Exception as ex:
+                    plugin.logger.error(f"map_mowpath failed for dev_id={dev_id}: {ex}")
+                    return _json_error(str(ex), 500)
+
+            ### end of mapping
 
             # Movement dispatcher (optional – wire to your existing move handlers)
             def _send_move_command(dev_id: int, direction: str, speed: float, continuous: bool):
@@ -815,6 +1121,9 @@ def start_webrtc_http(plugin):
             app.router.add_post("/webrtc/move_hold", move_hold)
             app.router.add_post("/webrtc/move_release", move_release)
             app.router.add_post("/webrtc/dock", dock_now)  # NEW
+            app.router.add_get("/map/{dev_id}", map_page)
+            app.router.add_get("/map/{dev_id}/geojson", map_geojson)
+            app.router.add_get("/map/{dev_id}/mowpath", map_mowpath)
 
             runner = web.AppRunner(app)
             await runner.setup()

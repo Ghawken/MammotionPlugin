@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import Any
 
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 
@@ -209,6 +210,8 @@ class HashList(DataClassORJSONMixin):
     plan: dict[str, Plan] = field(default_factory=dict)
     area_name: list[AreaHashNameList] = field(default_factory=list)
     current_mow_path: dict[int, MowPath] = field(default_factory=dict)
+    generated_geojson: dict[str, Any] = field(default_factory=dict)
+    generated_mow_path_geojson: dict[str, Any] = field(default_factory=dict)
 
     def update_hash_lists(self, hashlist: list[int], bol_hash: str | None = None) -> None:
         if bol_hash:
@@ -238,6 +241,19 @@ class HashList(DataClassORJSONMixin):
             return []
         # Combine data_couple from all RootHashLists
         return [i for root_list in self.root_hash_lists for obj in root_list.data for i in obj.data_couple]
+
+    @property
+    def area_root_hashlist(self) -> list[int]:
+        if not self.root_hash_lists:
+            return []
+        # Combine data_couple from all RootHashLists
+        return [
+            i
+            for root_list in self.root_hash_lists
+            for obj in root_list.data
+            for i in obj.data_couple
+            if root_list.sub_cmd == 0
+        ]
 
     def missing_hashlist(self, sub_cmd: int = 0) -> list[int]:
         """Return missing hashlist."""
@@ -439,5 +455,5 @@ class HashList(DataClassORJSONMixin):
         return False
 
     def invalidate_maps(self, bol_hash: int) -> None:
-        if MurMurHashUtil.hash_unsigned_list(self.hashlist) != bol_hash:
+        if MurMurHashUtil.hash_unsigned_list(self.area_root_hashlist) != bol_hash:
             self.root_hash_lists = []
