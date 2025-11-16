@@ -102,8 +102,9 @@ class Plugin(indigo.PluginBase):
         # In Plugin.__init__ (after super().__init__):
         self._unknown_area_logged = {}  # dev_id -> set([hashes])
         self._last_map_request = {}  # dev_id -> monotonic timestamp
-        self._last_cloud_relogin = {}  # dev_id -> monotonic timestamp
-
+        self._last_cloud_relogin = {}          # dev_id -> monotonic timestamp
+        self._cloud_relogin_in_progress = {}   # dev_id -> bool (true while relogin running)
+        self._pending_commands = {}            # dev_id -> list[(key, kwargs)] queued during relogin
         # Logging setup (pattern as in Device Timer / EVSEMaster)
         if hasattr(self, "indigo_log_handler") and self.indigo_log_handler:
             self.logger.removeHandler(self.indigo_log_handler)
@@ -262,6 +263,30 @@ class Plugin(indigo.PluginBase):
             self.logger.info("Entered remote manual control mode")
         except Exception as ex:
             self.logger.error(f"Enter manual control failed: {ex}")
+
+    async def _flush_pending_commands(self, dev_id: int) -> None:
+        """
+        Execute queued commands (key, kwargs) after a successful relogin.
+        Safe no-op if nothing queued.
+        """
+        # Defensive: make sure the data structure exists
+        if not hasattr(self, "_pending_commands"):
+            self._pending_commands = {}
+
+        pending = self._pending_commands.get(dev_id, [])
+        if not pending:
+            return
+
+        self.logger.debug(f"Flushing {len(pending)} queued command(s) for dev {dev_id}")
+        # Copy then clear to avoid recursion if a send re-queues
+        to_run = list(pending)
+        self._pending_commands[dev_id] = []
+
+        for key, kwargs in to_run:
+            try:
+                await self._send_command(dev_id, key, **(kwargs or {}))
+            except Exception as ex:
+                self.logger.debug(f"Queued command '{key}' failed after relogin: {ex}")
 
     async def _fetch_areas(self, dev_id: int):
         """
@@ -1910,7 +1935,7 @@ class Plugin(indigo.PluginBase):
         Central command dispatcher (coordinator-like):
         - Sends Mammotion commands via the current manager.
         - On auth error, triggers cloud refresh and retries once.
-        - Uses _pending_commands if a relogin is already in progress.
+
         """
         dev = indigo.devices.get(dev_id)
         if not dev:
