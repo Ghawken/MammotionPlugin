@@ -108,7 +108,8 @@ class Plugin(indigo.PluginBase):
         # Logging setup (pattern as in Device Timer / EVSEMaster)
         if hasattr(self, "indigo_log_handler") and self.indigo_log_handler:
             self.logger.removeHandler(self.indigo_log_handler)
-
+        self._last_plan_read = {}  # dev_id -> monotonic timestamp
+        self._waypoint_frames = {}  # dev_id -> {transaction_id: {frames: [], total: N}}
 
         self.logger.setLevel(logging.DEBUG)
         try:
@@ -135,7 +136,8 @@ class Plugin(indigo.PluginBase):
             self.logger.exception(exc)
 
         self.logger.info("")
-        self.logger.info("{0:=^120}".format(" Initializing Mammotion Mower "))
+        self.logger.info("{0:=^120}".format(" 🌱 Initializing Mammotion Mower 🚜 "))
+
         self.logger.info(f"{'Plugin name:':<28} {plugin_display_name}")
         self.logger.info(f"{'Plugin version:':<28} {plugin_version}")
         self.logger.info(f"{'Plugin ID:':<28} {plugin_id}")
@@ -143,7 +145,7 @@ class Plugin(indigo.PluginBase):
         self.logger.info(f"{'Silicon version:':<28} {platform.machine()}")
         self.logger.info(f"{'Python version:':<28} {sys.version.replace(os.linesep, ' ')}")
         self.logger.info(f"{'Python Directory:':<28} {sys.prefix.replace(os.linesep, ' ')}")
-
+        self.logger.info("{0:=^120}".format(" 🌿 Ready to Mow! 🌾 "))
         ##
         # Hook PyMammotion loggers to Indigo handlers so DEBUG from the library shows up
         # --- Diagnostic attach of pymammotion loggers (minimal) ---
@@ -178,7 +180,7 @@ class Plugin(indigo.PluginBase):
         logging.getLogger("pymammotion").addHandler(self.plugin_file_handler)
 
 
-        self.logger.info("{0:=^120}".format(" End Initializing "))
+        #self.logger.info("{0:=^120}".format(" End Initializing "))
 
     ########################################
     ## Streaming stuff
@@ -544,8 +546,6 @@ class Plugin(indigo.PluginBase):
             )
         )
 
-    def shutdown(self):
-        self.logger.debug("shutdown called")
 
     def _run_async_thread(self):
         self.logger.debug("_run_async_thread starting")
@@ -558,17 +558,77 @@ class Plugin(indigo.PluginBase):
         self.logger.debug("Starting event loop and setting up any connections")
 
     async def _async_stop(self):
+        """Enhanced async stop with proper cloud cleanup"""
         while True:
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(1.0)  # Check more frequently
             if self.stopThread:
-                # Cancel per-device tasks
-                for t in list(self._periodic_tasks.values()):
-                    if t and not t.done():
-                        t.cancel()
-                for t in list(self._manager_tasks.values()):
-                    if t and not t.done():
-                        t.cancel()
+                self.logger.info("🛑 Shutdown requested, cleaning up...")
+
+                # Cancel periodic tasks first
+                for dev_id, task in list(self._periodic_tasks.items()):
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await asyncio.wait_for(task, timeout=1.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass
+
+                # Stop cloud connections gracefully
+                for dev_id, mgr in list(self._mgr.items()):
+                    try:
+                        mower_name = self._mower_name.get(dev_id)
+                        if mgr and mower_name:
+                            device = mgr.get_device_by_name(mower_name)
+                            if device:
+                                # Stop cloud client
+                                cloud = getattr(device, "cloud", None)
+                                if cloud:
+                                    try:
+                                        if hasattr(cloud, "stop"):
+                                            await asyncio.wait_for(cloud.stop(), timeout=2.0)
+                                        elif hasattr(cloud, "close"):
+                                            await asyncio.wait_for(cloud.close(), timeout=2.0)
+                                    except asyncio.TimeoutError:
+                                        self.logger.debug(f"Cloud stop timeout for dev {dev_id}")
+                                    except Exception as ex:
+                                        self.logger.debug(f"Cloud stop error: {ex}")
+
+                                # Disable state updates
+                                if hasattr(device, "state"):
+                                    device.state.enabled = False
+                    except Exception as ex:
+                        self.logger.debug(f"Device cleanup error for {dev_id}: {ex}")
+
+                # Cancel manager tasks
+                for dev_id, task in list(self._manager_tasks.items()):
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await asyncio.wait_for(task, timeout=1.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass
+
+                self.logger.info("✅ Async cleanup complete")
                 break
+
+    def shutdown(self):
+        """Enhanced shutdown with timeout"""
+        self.logger.debug("🌾 Shutdown called")
+        self.stopThread = True
+
+        # Give async tasks time to clean up (but not too long)
+        import time
+        start = time.time()
+        max_wait = 5.0  # Maximum 5 seconds wait
+
+        while time.time() - start < max_wait:
+            # Check if async thread is done
+            if self._async_thread and not self._async_thread.is_alive():
+                break
+            time.sleep(0.1)
+
+        if self._async_thread and self._async_thread.is_alive():
+            self.logger.warning("⚠️ Async thread still running after {:.1f}s, forcing shutdown".format(max_wait))
 
 
     def _force_refresh_states(self, dev_id: int, delay: float = 0.3, min_interval: float = 0.8):
@@ -964,6 +1024,57 @@ class Plugin(indigo.PluginBase):
         except Exception:
             pass
 
+    def _process_waypoint_frames(self, dev_id: int, transaction_id: str, mgr, mower_name: str):
+        """
+        Process accumulated waypoint frames into mowing path data.
+        """
+        try:
+            if dev_id not in self._waypoint_frames:
+                return
+            if transaction_id not in self._waypoint_frames[dev_id]:
+                return
+
+            trans_data = self._waypoint_frames[dev_id][transaction_id]
+            frames = trans_data['frames']
+
+            # Combine all path packets
+            all_points = []
+            for frame_num in sorted(frames.keys()):
+                frame_data = frames[frame_num]
+                path_packets = frame_data.get('path_packets', [])
+                for packet in path_packets:
+                    # Each packet should have position data
+                    if hasattr(packet, 'x') and hasattr(packet, 'y'):
+                        all_points.append({
+                            'x': getattr(packet, 'x', 0),
+                            'y': getattr(packet, 'y', 0),
+                            'type': getattr(packet, 'type', 0)
+                        })
+
+            if all_points:
+                # Store in the mowing device map
+                md = mgr.mower(mower_name)
+                if md:
+                    if not hasattr(md, 'map'):
+                        md.map = type('obj', (object,), {})()
+
+                    # Store as current_mow_path for the state manager to pick up
+                    if not hasattr(md.map, 'current_mow_path'):
+                        md.map.current_mow_path = []
+
+                    md.map.current_mow_path = all_points
+                    md.map.current_mow_path_index = 0
+                    md.map.current_mow_path_finish = False
+
+                    self.logger.info(f"Processed {len(all_points)} waypoints into mow path")
+
+            # Clean up processed transaction
+            del self._waypoint_frames[dev_id][transaction_id]
+
+        except Exception as ex:
+            self.logger.debug(f"_process_waypoint_frames error: {ex}")
+
+
     async def _enable_cloud_and_bind(self, dev_id: int, mgr, mower_name: str):
         """
         Enable cloud updates and bind callbacks like HA; start map sync once and throttle area-name fetches.
@@ -987,12 +1098,106 @@ class Plugin(indigo.PluginBase):
         except Exception as ex:
             self.logger.debug(f"Enable cloud failed for '{mower_name}': {ex}")
 
-        # Bind a single cloud notification callback – on any inbound, refresh states
+        # Initialize waypoint accumulator if not exists
+        if not hasattr(self, '_waypoint_frames'):
+            self._waypoint_frames = {}
+
+        # Bind the cloud notification callback CORRECTLY
         try:
+            # The notification callback needs to be set on device.cloud, NOT cloud_client!
             cloud = getattr(device, "cloud", None)
+
             if cloud and hasattr(cloud, "set_notification_callback"):
                 def _cloud_notify(res):
-                    # Also detect when map names arrive so we don’t keep requesting
+                    # Log what type of response we're getting
+                    self.logger.debug(f"🔔 Cloud notification received: type={type(res).__name__}")
+
+                    # Check for waypoint frames
+                    try:
+                        # Check if res has nav attribute
+                        if hasattr(res, 'nav'):
+                            self.logger.debug(f"📍 Has nav attribute")
+                            nav = res.nav
+                            if hasattr(nav, 'cover_path_upload'):
+                                self.logger.info(f"🌾 Has cover_path_upload!")
+                                cover_path = nav.cover_path_upload
+                                transaction_id = getattr(cover_path, 'transaction_id', None)
+                                current_frame = getattr(cover_path, 'current_frame', 0)
+                                total_frame = getattr(cover_path, 'total_frame', 0)
+
+                                if transaction_id:
+                                    # Initialize transaction if new
+                                    if dev_id not in self._waypoint_frames:
+                                        self._waypoint_frames[dev_id] = {}
+
+                                    if transaction_id not in self._waypoint_frames[dev_id]:
+                                        self._waypoint_frames[dev_id][transaction_id] = {
+                                            'frames': {},
+                                            'total': total_frame,
+                                            'area': getattr(cover_path, 'area', None),
+                                            'data_hash': getattr(cover_path, 'data_hash', None)
+                                        }
+
+                                    # Store this frame's data
+                                    path_packets = getattr(cover_path, 'path_packets', [])
+                                    self._waypoint_frames[dev_id][transaction_id]['frames'][current_frame] = {
+                                        'path_packets': path_packets,
+                                        'time': getattr(cover_path, 'time', None),
+                                        'valid_paths': getattr(cover_path, 'vaild_path_num', 0)
+                                        # Note: typo in source
+                                    }
+
+                                    self.logger.info(
+                                        f"🌾 Waypoint frame {current_frame}/{total_frame} for transaction {transaction_id}, packets={len(path_packets)}"
+                                    )
+
+                                    # Check if all frames received and process
+                                    frames_dict = self._waypoint_frames[dev_id][transaction_id]['frames']
+                                    if len(frames_dict) == total_frame:
+                                        self.logger.info(
+                                            f"✅ All {total_frame} waypoint frames received for transaction {transaction_id}"
+                                        )
+                                        # Process accumulated waypoints into mowing path
+                                        try:
+                                            self._process_waypoint_frames(dev_id, transaction_id, mgr, mower_name)
+                                        except Exception as ex:
+                                            self.logger.debug(f"Process waypoint frames failed: {ex}")
+
+                    except Exception as ex:
+                        self.logger.debug(f"Waypoint check error: {ex}")
+
+                    # Check for direct mow_path updates in map
+                    try:
+                        if hasattr(res, 'map'):
+                            self.logger.debug(f"📍 Has map attribute")
+                            map_data = res.map
+                            if hasattr(map_data, 'mow_path'):
+                                mow_path = map_data.mow_path
+                                if mow_path and hasattr(mow_path, 'path'):
+                                    path_points = getattr(mow_path, 'path', [])
+                                    if path_points:
+                                        self.logger.info(
+                                            f"🎯 Direct mow_path received with {len(path_points)} points")
+                                        # Store directly to the device's map
+                                        md = mgr.mower(mower_name)
+                                        if md:
+                                            if not hasattr(md, 'current_mow_path'):
+                                                md.current_mow_path = []
+                                            md.current_mow_path = path_points
+                    except Exception as ex:
+                        self.logger.debug(f"Direct mow_path check error: {ex}")
+
+                    # Check for work data with path info
+                    try:
+                        if hasattr(res, 'work'):
+                            work = res.work
+                            if hasattr(work, 'path_pos_x') and hasattr(work, 'path_pos_y'):
+                                self.logger.debug(
+                                    f"📍 Work has path position: x={work.path_pos_x}, y={work.path_pos_y}")
+                    except Exception:
+                        pass
+
+                    # Also detect when map names arrive so we don't keep requesting
                     try:
                         md = mgr.mower(mower_name)
                         m = getattr(md, "map", None)
@@ -1003,25 +1208,42 @@ class Plugin(indigo.PluginBase):
                             self._area_names_ready[dev_id] = True
                     except Exception:
                         pass
+
                     self._schedule_state_refresh(dev_id)
-                    if hasattr(cloud, "set_error_callback"):
-                        async def _cloud_error(exc):
-                            if self._is_auth_error(exc):
-                                self.logger.warning(
-                                    f"Cloud error (auth) for '{mower_name}', scheduling re-login"
-                                )
-                                self._set_auth(dev_id, False)
-                                try:
-                                    await self._cloud_relogin_once(dev_id)
-                                except Exception as re:
-                                    self.logger.debug(f"_cloud_error: relogin failed for '{mower_name}': {re}")
 
-                        cloud.set_error_callback(self._async_wrap(_cloud_error))
+                # SET THE CALLBACK ON device.cloud, NOT cloud_client!
+                cloud.set_notification_callback(_cloud_notify)
+                self.logger.info(f"☁️ Cloud notification callback registered on device.cloud for '{mower_name}'")
 
+                # Set error callback
+                if hasattr(cloud, "set_error_callback"):
+                    async def _cloud_error(exc):
+                        if self._is_auth_error(exc):
+                            self.logger.warning(
+                                f"Cloud error (auth) for '{mower_name}', scheduling re-login"
+                            )
+                            self._set_auth(dev_id, False)
+                            try:
+                                await self._cloud_relogin_once(dev_id)
+                            except Exception as re:
+                                self.logger.debug(f"_cloud_error: relogin failed for '{mower_name}': {re}")
+
+                    # Need to wrap async callback properly
+                    def _cloud_error_wrapper(exc):
+                        """Wrapper to schedule async error handler"""
+                        if self._event_loop and not self._event_loop.is_closed():
+                            asyncio.run_coroutine_threadsafe(
+                                _cloud_error(exc),
+                                self._event_loop
+                            )
+
+                    cloud.set_error_callback(_cloud_error_wrapper)
             else:
-                self.logger.debug("cloud.set_notification_callback not available on this build")
+                self.logger.debug("device.cloud or set_notification_callback not available")
         except Exception as ex:
             self.logger.debug(f"Bind cloud notification failed: {ex}")
+
+            # Rest of the method remains the same...
 
         # Bind state_manager callbacks (properties/status/device events)
         try:
@@ -1076,6 +1298,8 @@ class Plugin(indigo.PluginBase):
         except Exception as ex:
             self.logger.debug(f"Area-name request scheduling failed: {ex}")
 
+
+
     # ========== Schedule a safe refresh from callbacks ==========
     def _schedule_state_refresh(self, dev_id: int):
         if not self._event_loop:
@@ -1099,7 +1323,41 @@ class Plugin(indigo.PluginBase):
                             await self._send_command(dev_id, "get_report_cfg")
                     except Exception:
                         pass
-
+                # --- NEW: plan sync parity with HA.update() ---
+                try:
+                    mgr = self._mgr.get(dev_id)
+                    name = self._mower_name.get(dev_id)
+                    if mgr and name:
+                        mowing_device = mgr.mower(name)
+                        m = getattr(mowing_device, "map", None) if mowing_device else None
+                        plan = getattr(m, "plan", {}) if m else {}
+                        if isinstance(plan, dict) and plan:
+                            first = list(plan.values())[0]
+                            total = getattr(first, "total_plan_num", None)
+                            if total is not None and total != len(plan):
+                                last_ts = float(self._last_plan_read.get(dev_id, 0.0))
+                                now_ts = time.monotonic()
+                                # mimic HA's 30min interval, but with a local guard
+                                if (now_ts - last_ts) > 1800.0:
+                                    self._last_plan_read[dev_id] = now_ts
+                                    self.logger.debug(f"Plan incomplete for dev {dev_id}; sending read_plan index=0")
+                                    try:
+                                        await self._send_command(dev_id, "read_plan", sub_cmd=2, plan_index=0)
+                                    except Exception as ex:
+                                        self.logger.debug(f"read_plan failed for dev {dev_id}: {ex}")
+                        elif isinstance(plan, dict) and not plan:
+                            last_ts = float(self._last_plan_read.get(dev_id, 0.0))
+                            now_ts = time.monotonic()
+                            if (now_ts - last_ts) > 1800.0:
+                                self._last_plan_read[dev_id] = now_ts
+                                self.logger.debug(f"No plan cached for dev {dev_id}; sending read_plan index=0")
+                                try:
+                                    await self._send_command(dev_id, "read_plan", sub_cmd=2, plan_index=0)
+                                except Exception as ex:
+                                    self.logger.debug(f"read_plan (empty) failed for dev {dev_id}: {ex}")
+                except Exception:
+                    # non-fatal
+                    self.logger.debug(f"Exception in Plan:", exc_info=True)
                 # If working, poll faster (like HA WORKING_INTERVAL); otherwise default
                 try:
                     dev = indigo.devices.get(dev_id)

@@ -102,6 +102,446 @@ def start_webrtc_http(plugin):
                 return web.Response(text=html, content_type="text/html")
 
             async def map_page(request: web.Request) -> web.Response:
+                """Enhanced Leaflet map page with tighter auto-zoom and no status window."""
+                try:
+                    dev_id = int(request.match_info.get("dev_id", "0"))
+                except Exception:
+                    dev_id = 0
+                plugin.logger.debug(f"map_page called for dev_id={dev_id}")
+
+                html = """<!doctype html>
+            <html>
+            <head>
+              <meta charset="utf-8"/>
+              <title>Mammotion Map – {dev_id}</title>
+              <meta name="viewport" content="width=device-width,initial-scale=1"/>
+              <link
+                rel="stylesheet"
+                href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+                crossorigin=""
+              />
+              <style>
+                html,body {{ margin:0; padding:0; height:100%; }}
+                #map {{ width:100%; height:100%; }}
+                .leaflet-container {{ background:#111; }}
+                .mammotion-label span {{
+                  background: rgba(0,0,0,0.6);
+                  color: #fff;
+                  padding: 2px 4px;
+                  border-radius: 3px;
+                  font-size: 11px;
+                  white-space: nowrap;
+                }}
+                .mower-marker {{
+                  background: #ff0000;
+                  border: 2px solid #ffffff;
+                  border-radius: 50%;
+                  width: 12px;
+                  height: 12px;
+                  margin-left: -8px;
+                  margin-top: -8px;
+                  box-shadow: 0 0 4px rgba(0,0,0,0.5);
+                  animation: pulse 2s infinite;
+                }}
+                @keyframes pulse {{
+                  0% {{ box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.7); }}
+                  70% {{ box-shadow: 0 0 0 10px rgba(255, 0, 0, 0); }}
+                  100% {{ box-shadow: 0 0 0 0 rgba(255, 0, 0, 0); }}
+                }}
+                #controls {{
+                  position: absolute;
+                  bottom: 10px;
+                  left: 10px;
+                  background: rgba(255,255,255,0.9);
+                  padding: 8px;
+                  border-radius: 4px;
+                  z-index: 1000;
+                }}
+                #controls button {{
+                  margin: 2px;
+                  padding: 4px 8px;
+                  cursor: pointer;
+                }}
+              </style>
+            </head>
+            <body>
+              <div id="map"></div>
+              <div id="controls">
+                <button onclick="fitAreas()">Fit Areas</button>
+                <button onclick="centerMower()">Center Mower</button>
+                <button onclick="fitAll()">Show All</button>
+              </div>
+              <script
+                src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+                crossorigin=""
+              ></script>
+              <script>
+                const devId = {dev_id};
+
+                // Initialize map with a default view
+                const map = L.map('map', {{
+                  center: [0, 0],
+                  zoom: 20,
+                  zoomControl: true,
+                  maxZoom: 25,
+                  minZoom: 10
+                }});
+
+                // Add tile layer
+                L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                  maxZoom: 22,
+                  attribution: '&copy; OpenStreetMap contributors'
+                }}).addTo(map);
+
+                // Layer groups for different feature types
+                const staticLayers = L.layerGroup().addTo(map);
+                const pathLayers = L.layerGroup().addTo(map);
+                let mowerMarker = null;
+                let allBounds = null;
+                let areaBounds = null;  // Bounds excluding stations
+
+                function styleFromProps(props) {{
+                  const base = {{
+                    color: props.color || '#00ff00',
+                    weight: props.weight || 2,
+                    opacity: props.opacity ?? 0.9,
+                    fillOpacity: props.fillOpacity ?? 0.2
+                  }};
+                  if (props.type_name === 'active_mow_path') {{
+                    base.color = props.color || '#00ff00';
+                    base.weight = props.weight || 3;
+                    base.opacity = 1.0;
+                  }} else if (props.type_name === 'complete_mow_path') {{
+                    base.color = props.color || '#00ffff';
+                    base.weight = props.weight || 2;
+                    base.opacity = 0.8;
+                  }}
+                  return base;
+                }}
+
+                // Compute polygon centroid for labels
+                function polygonCentroid(latlngs) {{
+                  let x = 0, y = 0, z = 0;
+                  const n = latlngs.length;
+                  if (!n) return null;
+                  latlngs.forEach(ll => {{
+                    const lat = ll.lat * Math.PI / 180;
+                    const lon = ll.lng * Math.PI / 180;
+                    x += Math.cos(lat) * Math.cos(lon);
+                    y += Math.cos(lat) * Math.sin(lon);
+                    z += Math.sin(lat);
+                  }});
+                  x /= n; y /= n; z /= n;
+                  const lon = Math.atan2(y, x);
+                  const hyp = Math.sqrt(x * x + y * y);
+                  const lat = Math.atan2(z, hyp);
+                  return L.latLng(lat * 180 / Math.PI, lon * 180 / Math.PI);
+                }}
+
+                function addLabelForFeature(feature, layer) {{
+                  const props = feature.properties || {{}};
+                  const labelText = props.title || props.Name || '';
+                  if (!labelText) return;
+
+                  let labelLatLng = null;
+
+                  if (layer instanceof L.Marker || layer instanceof L.CircleMarker) {{
+                    labelLatLng = layer.getLatLng();
+                  }} else if (layer instanceof L.Polygon || layer instanceof L.Polyline) {{
+                    const latlngs = layer.getLatLngs();
+                    let ring = latlngs;
+                    if (Array.isArray(latlngs[0])) {{
+                      ring = latlngs[0]; // outer ring
+                    }}
+                    labelLatLng = polygonCentroid(ring);
+                  }}
+
+                  if (!labelLatLng) return;
+
+                  const label = L.marker(labelLatLng, {{
+                    interactive: false,
+                    icon: L.divIcon({{
+                      className: 'mammotion-label',
+                      html: `<span>${{labelText}}</span>`,
+                      iconSize: [0, 0]
+                    }})
+                  }});
+                  staticLayers.addLayer(label);
+                }}
+
+                function isNearZero(coords) {{
+                  // Check if coordinates are near (0,0) - likely uninitialized stations
+                  if (Array.isArray(coords) && coords.length >= 2) {{
+                    return Math.abs(coords[0]) < 0.00001 && Math.abs(coords[1]) < 0.00001;
+                  }}
+                  return false;
+                }}
+
+                function updateMowerPosition(data) {{
+                  // Find mower feature in the data
+                  const mowerFeature = data.features?.find(f => 
+                    f.properties?.type_name === 'mower' && 
+                    f.geometry?.type === 'Point'
+                  );
+
+                  if (mowerFeature) {{
+                    const [lon, lat] = mowerFeature.geometry.coordinates;
+
+                    if (mowerMarker) {{
+                      // Update existing marker position
+                      mowerMarker.setLatLng([lat, lon]);
+                    }} else {{
+                      // Create new mower marker with custom icon
+                      const mowerIcon = L.divIcon({{
+                        className: 'mower-marker',
+                        iconSize: [16, 16],
+                        iconAnchor: [8, 8]
+                      }});
+
+                      mowerMarker = L.marker([lat, lon], {{
+                        icon: mowerIcon,
+                        title: mowerFeature.properties.title || 'Mower',
+                        zIndexOffset: 1000
+                      }}).addTo(map);
+
+                      // Add popup with mower info
+                      mowerMarker.bindPopup(`
+                        <b>${{mowerFeature.properties.title || 'Mower'}}</b><br>
+                        Position: ${{lat.toFixed(6)}}, ${{lon.toFixed(6)}}
+                      `);
+                    }}
+
+                    // Update bounds if mower is not at (0,0)
+                    if (!isNearZero([lon, lat])) {{
+                      if (areaBounds) {{
+                        areaBounds.extend([lat, lon]);
+                      }}
+                    }}
+                  }}
+                }}
+
+                function loadStaticMap() {{
+                  return fetch(`/map/${{devId}}/geojson`)
+                    .then(r => r.json())
+                    .then(data => {{
+                      if (!data || data.ok === false) {{
+                        console.warn('Static map error', data);
+                        return null;
+                      }}
+
+                      // Clear and rebuild static layers
+                      staticLayers.clearLayers();
+                      allBounds = L.latLngBounds();
+                      areaBounds = L.latLngBounds();
+
+                      // Track if we have valid area features
+                      let hasValidAreas = false;
+
+                      // Process all features
+                      const geoJsonData = {{
+                        type: "FeatureCollection",
+                        features: data.features.filter(f => 
+                          f.properties?.type_name !== 'mower'
+                        )
+                      }};
+
+                      const layer = L.geoJSON(geoJsonData, {{
+                        style: f => styleFromProps(f.properties || {{}}),
+                        pointToLayer: (feature, latlng) => {{
+                          const props = feature.properties || {{}};
+                          const coords = feature.geometry?.coordinates;
+
+                          // Always add to allBounds
+                          allBounds.extend(latlng);
+
+                          // Only add to areaBounds if not a station at/near (0,0)
+                          const isStation = props.type_name === 'station';
+                          if (!isStation || !isNearZero(coords)) {{
+                            areaBounds.extend(latlng);
+                            if (!isStation) hasValidAreas = true;
+                          }}
+
+                          return L.circleMarker(latlng, {{
+                            ...styleFromProps(props),
+                            radius: props.radius || 7
+                          }});
+                        }},
+                        onEachFeature: (feature, layer) => {{
+                          const props = feature.properties || {{}};
+                          const isStation = props.type_name === 'station';
+                          const isArea = props.type_name === 'area';
+                          const isObstacle = props.type_name === 'obstacle';
+                          const isPath = props.type_name === 'path';
+
+                          // Add to appropriate bounds
+                          if (layer.getBounds) {{
+                            const bounds = layer.getBounds();
+                            allBounds.extend(bounds);
+
+                            // Only add meaningful features to areaBounds
+                            if (isArea || isObstacle || isPath) {{
+                              areaBounds.extend(bounds);
+                              hasValidAreas = true;
+                            }}
+                          }} else if (layer.getLatLng) {{
+                            const latLng = layer.getLatLng();
+                            allBounds.extend(latLng);
+
+                            if (!isStation || !isNearZero([latLng.lng, latLng.lat])) {{
+                              areaBounds.extend(latLng);
+                              if (!isStation) hasValidAreas = true;
+                            }}
+                          }}
+
+                          addLabelForFeature(feature, layer);
+                        }}
+                      }});
+
+                      staticLayers.addLayer(layer);
+
+                      // Update mower position from this data
+                      updateMowerPosition(data);
+
+                      // Fit map with very tight padding (0.05 instead of 0.1)
+                      if (areaBounds.isValid() && hasValidAreas) {{
+                        // Use minimal padding for tightest fit
+                        map.fitBounds(areaBounds.pad(0.05), {{ 
+                          maxZoom: 21,  // Allow closer zoom
+                          animate: false 
+                        }});
+                      }} else if (allBounds.isValid()) {{
+                        // Fallback to all bounds if no valid areas
+                        map.fitBounds(allBounds.pad(0.05), {{ 
+                          maxZoom: 21,
+                          animate: false 
+                        }});
+                      }}
+
+                      return layer;
+                    }})
+                    .catch(err => {{
+                      console.error('Static map fetch failed', err);
+                    }});
+                }}
+
+                function loadMowPath() {{
+                  return fetch(`/map/${{devId}}/mowpath`)
+                    .then(r => r.json())
+                    .then(data => {{
+                      if (!data || data.ok === false) {{
+                        console.warn('Mow path error', data);
+                        return null;
+                      }}
+
+                      // Clear and rebuild path layers
+                      pathLayers.clearLayers();
+
+                      const layer = L.geoJSON(data, {{
+                        style: f => styleFromProps(f.properties || {{}}),
+                        onEachFeature: (feature, layer) => {{
+                          // Extend area bounds for paths
+                          if (layer.getBounds && layer.getBounds().isValid()) {{
+                            if (areaBounds) {{
+                              areaBounds.extend(layer.getBounds());
+                            }}
+                          }}
+                        }}
+                      }});
+
+                      pathLayers.addLayer(layer);
+
+                      // Re-fit after adding paths with tight padding
+                      if (areaBounds && areaBounds.isValid()) {{
+                        map.fitBounds(areaBounds.pad(0.05), {{ 
+                          maxZoom: 21,
+                          animate: true,
+                          duration: 0.5
+                        }});
+                      }}
+
+                      return layer;
+                    }})
+                    .catch(err => {{
+                      console.error('Mow path fetch failed', err);
+                    }});
+                }}
+
+                function refreshMowerOnly() {{
+                  // Quick update of just mower position
+                  fetch(`/map/${{devId}}/geojson`)
+                    .then(r => r.json())
+                    .then(data => {{
+                      if (data && data.features) {{
+                        updateMowerPosition(data);
+                      }}
+                    }})
+                    .catch(err => console.error('Mower update failed', err));
+                }}
+
+                // Control functions
+                function fitAll() {{
+                  if (allBounds && allBounds.isValid()) {{
+                    map.fitBounds(allBounds.pad(0.05), {{ maxZoom: 21 }});
+                  }}
+                }}
+
+                function fitAreas() {{
+                  if (areaBounds && areaBounds.isValid()) {{
+                    map.fitBounds(areaBounds.pad(0.05), {{ maxZoom: 21 }});
+                  }}
+                }}
+
+                function centerMower() {{
+                  if (mowerMarker) {{
+                    map.setView(mowerMarker.getLatLng(), 21);
+                  }}
+                }}
+
+                // Initial load
+                Promise.all([
+                  loadStaticMap(),
+                  loadMowPath()
+                ]).then(() => {{
+                  console.log('Map loaded');
+                }});
+
+                // Periodic updates
+                // Update mower position every 5 seconds
+                setInterval(refreshMowerOnly, 5000);
+
+                // Full refresh of paths every 30 seconds
+                setInterval(loadMowPath, 30000);
+
+                // Full map refresh every 2 minutes
+                setInterval(() => {{
+                  loadStaticMap();
+                  loadMowPath();
+                }}, 120000);
+
+                // Keyboard shortcuts
+                document.addEventListener('keydown', (e) => {{
+                  if (e.key === 'r' || e.key === 'R') {{
+                    loadStaticMap();
+                    loadMowPath();
+                  }}
+                  if (e.key === 'c' || e.key === 'C') {{
+                    centerMower();
+                  }}
+                  if (e.key === 'f' || e.key === 'F') {{
+                    fitAreas();
+                  }}
+                  if (e.key === 'a' || e.key === 'A') {{
+                    fitAll();
+                  }}
+                }});
+              </script>
+            </body>
+            </html>
+            """.format(dev_id=dev_id)
+
+                return web.Response(text=html, content_type="text/html")
+
+            async def map_page_old(request: web.Request) -> web.Response:
                 """Leaflet map page that calls the GeoJSON endpoints."""
                 try:
                     dev_id = int(request.match_info.get("dev_id", "0"))
@@ -258,8 +698,7 @@ def start_webrtc_http(plugin):
 
             async def map_geojson(request: web.Request) -> web.Response:
                 """
-                Full map GeoJSON using latest PyMammotion:
-                MowerStateManager.generate_geojson(rtk, dock).
+                Full map GeoJSON using PyMammotion with proper mower position.
                 """
                 try:
                     dev_id = int(request.match_info["dev_id"])
@@ -291,13 +730,348 @@ def start_webrtc_http(plugin):
                         state_mgr = MowerStateManager(mowing_device)
                         setattr(mowing_device, "state_manager", state_mgr)
 
+                    # Base geojson (areas, paths, RTK, dock)
                     geo = state_mgr.generate_geojson(rtk, dock)
+
+                    # --- Add mower position using multiple data sources ---
+                    try:
+                        import math
+
+                        # Get RTK reference point (in radians)
+                        rtk_lat_rad = getattr(rtk, "latitude", None)
+                        rtk_lon_rad = getattr(rtk, "longitude", None)
+
+                        if rtk_lat_rad is None or rtk_lon_rad is None:
+                            plugin.logger.debug("map_geojson: RTK reference not available")
+                            return web.json_response(geo)
+
+                        # Convert RTK to degrees
+                        rtk_lat = rtk_lat_rad * 180.0 / math.pi
+                        rtk_lon = rtk_lon_rad * 180.0 / math.pi
+
+                        # Try multiple sources for mower position
+                        pos_x = None
+                        pos_y = None
+
+                        # Priority 1: report_data.local (most accurate when available)
+                        report_data = getattr(mowing_device, "report_data", None)
+                        if report_data:
+                            local_status = getattr(report_data, "local", None)
+                            if local_status:
+                                pos_x = getattr(local_status, "pos_x", None)
+                                pos_y = getattr(local_status, "pos_y", None)
+                                if pos_x is not None and pos_y is not None:
+                                    plugin.logger.debug(
+                                        f"map_geojson: using report_data.local position x={pos_x}, y={pos_y}")
+
+                            # Priority 2: report_data.vision_info
+                            if pos_x is None:
+                                vision_info = getattr(report_data, "vision_info", None)
+                                if vision_info:
+                                    vx = getattr(vision_info, "x", None)
+                                    vy = getattr(vision_info, "y", None)
+                                    if vx is not None and vy is not None:
+                                        pos_x = float(vx)
+                                        pos_y = float(vy)
+                                        plugin.logger.debug(
+                                            f"map_geojson: using vision_info position x={pos_x}, y={pos_y}")
+
+                            # Priority 3: work.path_pos (in mm, needs scaling)
+                            if pos_x is None:
+                                work = getattr(report_data, "work", None)
+                                if work:
+                                    wpx = getattr(work, "path_pos_x", None)
+                                    wpy = getattr(work, "path_pos_y", None)
+                                    if wpx is not None and wpy is not None:
+                                        pos_x = float(wpx) / 1000.0
+                                        pos_y = float(wpy) / 1000.0
+                                        plugin.logger.debug(
+                                            f"map_geojson: using work.path_pos position x={pos_x}, y={pos_y}")
+
+                            # Priority 4: raw_data.nav.cover_path_upload (current mowing path)
+                            if pos_x is None:
+                                raw_data = getattr(mowing_device, "raw_data", None)
+                                if raw_data:
+                                    nav = getattr(raw_data, "nav", None)
+                                    if nav:
+                                        cover_path = getattr(nav, "cover_path_upload", None)
+                                        if cover_path:
+                                            path_packets = getattr(cover_path, "path_packets", [])
+                                            if path_packets:
+                                                # Get the first point of the current path
+                                                for packet in path_packets:
+                                                    data_couples = getattr(packet, "data_couple", [])
+                                                    if data_couples:
+                                                        couple = data_couples[0]  # Take first point
+                                                        pos_x = getattr(couple, "x", None)
+                                                        pos_y = getattr(couple, "y", None)
+                                                        if pos_x is not None and pos_y is not None:
+                                                            plugin.logger.debug(
+                                                                f"map_geojson: using cover_path_upload position x={pos_x}, y={pos_y}")
+                                                            break
+
+                        # If we have position data, convert to lat/lon
+                        if pos_x is not None and pos_y is not None:
+                            # Convert X/Y (meters from RTK base) to lat/lon offsets
+                            # X is East/West, Y is North/South
+                            lat_offset = pos_y / 111111.0  # ~111km per degree latitude
+                            lon_offset = pos_x / (111111.0 * math.cos(math.radians(rtk_lat)))
+
+                            mower_lat = rtk_lat + lat_offset
+                            mower_lon = rtk_lon + lon_offset
+
+                            # Add mower feature
+                            mower_feature = {
+                                "type": "Feature",
+                                "properties": {
+                                    "type_name": "mower",
+                                    "title": mower_name or "Mower",
+                                    "color": "#ff0000",
+                                    "weight": 2,
+                                    "opacity": 1.0,
+                                    "fillOpacity": 0.9,
+                                    "radius": 6,
+                                    "source": "device"  # Mark as device-sourced position
+                                },
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [mower_lon, mower_lat]  # GeoJSON is [lon, lat]
+                                }
+                            }
+                            geo.setdefault("features", []).append(mower_feature)
+                            plugin.logger.debug(
+                                f"map_geojson: added mower at lon={mower_lon:.6f}, lat={mower_lat:.6f} (from x={pos_x}, y={pos_y})")
+                        else:
+                            # Fallback: try location.device if available
+                            dev_loc = getattr(location, "device", None)
+                            if dev_loc:
+                                lat_r = getattr(dev_loc, "latitude", None)
+                                lon_r = getattr(dev_loc, "longitude", None)
+                                if lat_r is not None and lon_r is not None:
+                                    # Convert radians to degrees
+                                    lat_deg = lat_r * 180.0 / math.pi
+                                    lon_deg = lon_r * 180.0 / math.pi
+
+                                    mower_feature = {
+                                        "type": "Feature",
+                                        "properties": {
+                                            "type_name": "mower",
+                                            "title": mower_name or "Mower",
+                                            "color": "#ff0000",
+                                            "weight": 2,
+                                            "opacity": 1.0,
+                                            "fillOpacity": 0.9,
+                                            "radius": 6,
+                                            "source": "gps"
+                                        },
+                                        "geometry": {
+                                            "type": "Point",
+                                            "coordinates": [lon_deg, lat_deg]
+                                        }
+                                    }
+                                    geo.setdefault("features", []).append(mower_feature)
+                                    plugin.logger.debug(
+                                        f"map_geojson: added mower from GPS at lon={lon_deg:.6f}, lat={lat_deg:.6f}")
+                            else:
+                                plugin.logger.debug("map_geojson: no mower position available")
+
+                    except Exception as ex_mower:
+                        plugin.logger.debug(f"map_geojson: mower point generation failed: {ex_mower}")
+
                     return web.json_response(geo)
+
                 except Exception as ex:
                     plugin.logger.error(f"map_geojson failed for dev_id={dev_id}: {ex}")
                     return _json_error(str(ex), 500)
 
+            # Add this to your webrtc.py file, enhancing the existing map_mowpath function
+
             async def map_mowpath(request: web.Request) -> web.Response:
+                """
+                Enhanced mowing path GeoJSON that accumulates waypoint frames.
+                """
+                try:
+                    dev_id = int(request.match_info["dev_id"])
+                except Exception:
+                    return _json_error("invalid dev_id", 400)
+
+                plugin.logger.debug(f"map_mowpath: called for dev_id={dev_id}")
+
+                try:
+                    from pymammotion.data.mower_state_manager import MowerStateManager
+                except Exception as ex:
+                    plugin.logger.error(f"map_mowpath: MowerStateManager import failed: {ex}")
+                    return _json_error("MowerStateManager not available", 500)
+
+                dev, mgr, mower_name, mowing_device = await _get_device_and_mgr(dev_id)
+                if not dev or not mgr or not mower_name or not mowing_device:
+                    return _json_error("device not ready", 404)
+
+                try:
+                    location = getattr(mowing_device, "location", None)
+                    rtk = getattr(location, "RTK", None)
+                    if not rtk:
+                        return _json_error("RTK data not available yet", 503)
+
+                    import math
+
+                    # Get RTK reference for coordinate conversion
+                    rtk_lat_rad = getattr(rtk, "latitude", None)
+                    rtk_lon_rad = getattr(rtk, "longitude", None)
+
+                    if rtk_lat_rad is None or rtk_lon_rad is None:
+                        plugin.logger.debug("map_mowpath: RTK reference not available")
+                        return _json_error("RTK reference not available", 503)
+
+                    rtk_lat = rtk_lat_rad * 180.0 / math.pi
+                    rtk_lon = rtk_lon_rad * 180.0 / math.pi
+
+                    # Initialize GeoJSON
+                    geojson = {
+                        "type": "FeatureCollection",
+                        "features": []
+                    }
+
+                    # Get standard mowing path from state manager
+                    state_mgr = getattr(mowing_device, "state_manager", None)
+                    if not isinstance(state_mgr, MowerStateManager):
+                        plugin.logger.debug("map_mowpath: creating MowerStateManager for mowing_device")
+                        state_mgr = MowerStateManager(mowing_device)
+                        setattr(mowing_device, "state_manager", state_mgr)
+
+                    try:
+                        std_geo = state_mgr.generate_mowing_geojson(rtk)
+                        if std_geo and "features" in std_geo:
+                            geojson["features"].extend(std_geo["features"])
+                    except Exception as ex:
+                        plugin.logger.debug(f"generate_mowing_geojson failed: {ex}")
+
+                    # Check if plugin has accumulated waypoint frames
+                    if hasattr(plugin, "_waypoint_frames"):
+                        waypoint_data = plugin._waypoint_frames.get(dev_id, {})
+                        for transaction_id, transaction_data in waypoint_data.items():
+                            frames_dict = transaction_data.get("frames", {})
+                            if frames_dict:
+                                all_points = []
+                                # Process frames in order
+                                for frame_num in sorted(frames_dict.keys()):
+                                    frame_data = frames_dict[frame_num]
+                                    for packet in frame_data.get("path_packets", []):
+                                        data_couples = getattr(packet, "data_couple", []) if hasattr(packet,
+                                                                                                     "data_couple") else packet.get(
+                                            "data_couple", [])
+                                        for couple in data_couples:
+                                            x = getattr(couple, "x", None) if hasattr(couple, "x") else couple.get("x")
+                                            y = getattr(couple, "y", None) if hasattr(couple, "y") else couple.get("y")
+                                            if x is not None and y is not None:
+                                                # Convert to lat/lon
+                                                lat_offset = y / 111111.0
+                                                lon_offset = x / (111111.0 * math.cos(math.radians(rtk_lat)))
+                                                lon = rtk_lon + lon_offset
+                                                lat = rtk_lat + lat_offset
+                                                all_points.append([lon, lat])
+
+                                if len(all_points) > 1:
+                                    feature = {
+                                        "type": "Feature",
+                                        "geometry": {
+                                            "type": "LineString",
+                                            "coordinates": all_points
+                                        },
+                                        "properties": {
+                                            "type_name": "complete_mow_path",
+                                            "color": "#00ffff",
+                                            "weight": 2,
+                                            "opacity": 0.8,
+                                            "title": f"Complete Path ({len(frames_dict)} frames)",
+                                            "transaction_id": transaction_id
+                                        }
+                                    }
+                                    geojson["features"].append(feature)
+
+                    # Add current frame from raw_data.nav.cover_path_upload
+                    raw_data = getattr(mowing_device, "raw_data", None)
+                    if raw_data:
+                        nav = getattr(raw_data, "nav", None)
+                        if nav:
+                            cover_path = getattr(nav, "cover_path_upload", None)
+                            if cover_path:
+                                plugin.logger.debug(
+                                    f"cover_path_upload: frame {getattr(cover_path, 'current_frame', 0)}/"
+                                    f"{getattr(cover_path, 'total_frame', 0)}"
+                                )
+
+                                path_packets = getattr(cover_path, "path_packets", [])
+                                if path_packets:
+                                    for packet in path_packets:
+                                        points = []
+                                        data_couples = getattr(packet, "data_couple", [])
+                                        for couple in data_couples:
+                                            x = getattr(couple, "x", 0)
+                                            y = getattr(couple, "y", 0)
+                                            if x != 0 or y != 0:
+                                                # Convert to lat/lon
+                                                lat_offset = y / 111111.0
+                                                lon_offset = x / (111111.0 * math.cos(math.radians(rtk_lat)))
+                                                lon = rtk_lon + lon_offset
+                                                lat = rtk_lat + lat_offset
+                                                points.append([lon, lat])
+
+                                        if len(points) > 1:
+                                            feature = {
+                                                "type": "Feature",
+                                                "geometry": {
+                                                    "type": "LineString",
+                                                    "coordinates": points
+                                                },
+                                                "properties": {
+                                                    "type_name": "active_mow_path",
+                                                    "color": "#00ff00",
+                                                    "weight": 3,
+                                                    "opacity": 1.0,
+                                                    "title": f"Active Path (frame {getattr(cover_path, 'current_frame', 0)})"
+                                                }
+                                            }
+                                            geojson["features"].append(feature)
+
+                    plugin.logger.debug(f"map_mowpath: returning {len(geojson['features'])} features")
+                    return web.json_response(geojson)
+
+                except Exception as ex:
+                    plugin.logger.error(f"map_mowpath failed for dev_id={dev_id}: {ex}")
+                    return _json_error(str(ex), 500)
+
+            def convert_xy_to_latlon(x: float, y: float, rtk) -> tuple:
+                """
+                Convert local X/Y coordinates to latitude/longitude using RTK reference.
+                """
+                import math
+
+                try:
+                    # Get RTK reference point
+                    rtk_lat = getattr(rtk, "latitude", 0)
+                    rtk_lon = getattr(rtk, "longitude", 0)
+
+                    if rtk_lat == 0 and rtk_lon == 0:
+                        # No valid RTK reference, return a default
+                        return (0, 0)
+
+                    # Convert from radians if needed
+                    if abs(rtk_lat) < 2:  # Likely in radians
+                        rtk_lat = rtk_lat * 180.0 / math.pi
+                        rtk_lon = rtk_lon * 180.0 / math.pi
+
+                    # Simple projection (good enough for small areas)
+                    # Approximate meters to degrees
+                    lat_offset = y / 111111.0  # ~111km per degree latitude
+                    lon_offset = x / (111111.0 * math.cos(math.radians(rtk_lat)))
+
+                    return (rtk_lat + lat_offset, rtk_lon + lon_offset)
+                except Exception as ex:
+                    plugin.logger.debug(f"convert_xy_to_latlon failed: {ex}")
+                    return (0, 0)
+
+            async def map_mowpath_old(request: web.Request) -> web.Response:
                 """
                 Mowing path GeoJSON using MowerStateManager.generate_mowing_geojson(rtk).
                 """
