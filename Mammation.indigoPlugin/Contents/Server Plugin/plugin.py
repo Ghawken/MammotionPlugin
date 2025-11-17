@@ -1077,7 +1077,13 @@ class Plugin(indigo.PluginBase):
 
     async def _enable_cloud_and_bind(self, dev_id: int, mgr, mower_name: str):
         """
-        Enable cloud updates and bind callbacks like HA; start map sync once and throttle area-name fetches.
+        Enable cloud updates and bind callbacks.
+
+        Notes for this plugin:
+        - device.cloud is the object that actually fires set_notification_callback,
+          with res typically shaped as (topic: str, payload: protobuf).
+        - device.cloud_client is used for commands (and session refresh), but does
+          not raise notification callbacks in this build.
         """
         device = None
         try:
@@ -1090,132 +1096,147 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"No device manager wrapper for '{mower_name}', continuing without direct callbacks")
             return
 
-        # Enable scheduled updates
+        # Enable scheduled updates and make sure cloud is running
         try:
             device.state.enabled = True
-            if device.cloud and getattr(device.cloud, "stopped", False):
-                await device.cloud.start()
+            cloud = getattr(device, "cloud", None)
+            self.logger.debug(
+                f"_enable_cloud_and_bind: device.cloud={cloud!r}, "
+                f"type={type(cloud).__name__ if cloud else None}"
+            )
+            if cloud and getattr(cloud, "stopped", False):
+                await cloud.start()
         except Exception as ex:
             self.logger.debug(f"Enable cloud failed for '{mower_name}': {ex}")
-
-        # Initialize waypoint accumulator if not exists
-        if not hasattr(self, '_waypoint_frames'):
+        await asyncio.sleep(1)
+        # Waypoint accumulator
+        if not hasattr(self, "_waypoint_frames"):
             self._waypoint_frames = {}
-
-        # Bind the cloud notification callback CORRECTLY
+        # Bind state_manager.cloud_on_notification_callback so we see ALL LubaMsg notifications
+        # Bind state_manager.cloud_on_notification_callback – primary LubaMsg stream
         try:
-            # The notification callback needs to be set on device.cloud, NOT cloud_client!
+            sm = getattr(device, "state_manager", None)
+            if sm is not None and hasattr(sm, "cloud_on_notification_callback"):
+
+                def _sm_cloud_notify(res):
+                    """
+                    res: tuple[str, Any] from MowerStateManager.notification:
+                      ('nav'|'sys'|'driver'|'net'|'mul'|'ota', payload)
+                    StateManager has already updated device.state before this is called.
+                    """
+                    try:
+                        topic, payload = res
+                    except Exception:
+                        self.logger.debug(f"[SM-NOTIFY] unexpected res={res!r}")
+                        return
+
+                    self.logger.debug(
+                        f"[SM-NOTIFY] topic={topic}, payload_type={type(payload).__name__}"
+                    )
+
+                    # --- nav → cover_path_upload / waypoints / mow_path ---
+                    try:
+                        nav = payload if topic == "nav" else getattr(payload, "nav", None)
+                        if nav and hasattr(nav, "cover_path_upload"):
+                            cover_path = nav.cover_path_upload
+                            transaction_id = getattr(cover_path, "transaction_id", None)
+                            current_frame = getattr(cover_path, "current_frame", 0)
+                            total_frame = getattr(cover_path, "total_frame", 0)
+
+                            self.logger.debug(
+                                f"📍 cover_path_upload frame {current_frame}/{total_frame}, "
+                                f"transaction_id={transaction_id}"
+                            )
+
+                            path_packets = getattr(cover_path, "path_packets", []) or []
+                            if not transaction_id or not total_frame:
+                                # Single-frame / debug only
+                                self.logger.debug(
+                                    f"cover_path_upload has no transaction_id/total_frame; "
+                                    f"path_packets={len(path_packets)}"
+                                )
+                            else:
+                                # Multi-frame accumulation (unchanged from your earlier _cloud_notify)
+                                if dev_id not in self._waypoint_frames:
+                                    self._waypoint_frames[dev_id] = {}
+                                if transaction_id not in self._waypoint_frames[dev_id]:
+                                    self._waypoint_frames[dev_id][transaction_id] = {
+                                        "frames": {},
+                                        "total": total_frame,
+                                        "area": getattr(cover_path, "area", None),
+                                        "data_hash": getattr(cover_path, "data_hash", None),
+                                    }
+
+                                self._waypoint_frames[dev_id][transaction_id]["frames"][
+                                    current_frame
+                                ] = {
+                                    "path_packets": path_packets,
+                                    "time": getattr(cover_path, "time", None),
+                                    "valid_paths": getattr(
+                                        cover_path, "vaild_path_num", 0
+                                    ),
+                                }
+
+                                self.logger.info(
+                                    f"🌾 Waypoint frame {current_frame}/{total_frame} "
+                                    f"for transaction {transaction_id}, packets={len(path_packets)}"
+                                )
+
+                                frames_dict = self._waypoint_frames[dev_id][transaction_id]["frames"]
+                                if len(frames_dict) == total_frame:
+                                    self.logger.info(
+                                        f"✅ All {total_frame} waypoint frames received "
+                                        f"for transaction {transaction_id}"
+                                    )
+                                    try:
+                                        self._process_waypoint_frames(
+                                            dev_id, transaction_id, mgr, mower_name
+                                        )
+                                    except Exception as ex2:
+                                        self.logger.debug(
+                                            f"Process waypoint frames failed: {ex2}"
+                                        )
+                    except Exception as ex:
+                        self.logger.debug(f"[SM-NOTIFY] nav/waypoint handling error: {ex}")
+
+                    # --- sys / others: just refresh Indigo; MowerStateManager has already updated report_data ---
+                    self._schedule_state_refresh(dev_id)
+
+                sm.cloud_on_notification_callback.add_subscribers(_sm_cloud_notify)
+                self.logger.debug(
+                    f"[SM-bind] cloud_on_notification_callback subscriber attached for '{mower_name}'"
+                )
+        except Exception as ex:
+            self.logger.debug(f"[SM-bind] cloud_on_notification_callback bind failed: {ex}")
+        # Bind the cloud notification callback CORRECTLY
+        # Bind the cloud notification callback (keep minimal; SM handles detailed decode)
+        try:
             cloud = getattr(device, "cloud", None)
 
             if cloud and hasattr(cloud, "set_notification_callback"):
+
                 def _cloud_notify(res):
-                    # Log what type of response we're getting
-                    self.logger.debug(f"🔔 Cloud notification received: type={type(res).__name__}")
-
-                    # Check for waypoint frames
+                    # PyMammotion still calls this for some messages (e.g. map sync nav),
+                    # but detailed logic lives in state_manager.cloud_on_notification_callback.
                     try:
-                        # Check if res has nav attribute
-                        if hasattr(res, 'nav'):
-                            self.logger.debug(f"📍 Has nav attribute")
-                            nav = res.nav
-                            if hasattr(nav, 'cover_path_upload'):
-                                self.logger.info(f"🌾 Has cover_path_upload!")
-                                cover_path = nav.cover_path_upload
-                                transaction_id = getattr(cover_path, 'transaction_id', None)
-                                current_frame = getattr(cover_path, 'current_frame', 0)
-                                total_frame = getattr(cover_path, 'total_frame', 0)
-
-                                if transaction_id:
-                                    # Initialize transaction if new
-                                    if dev_id not in self._waypoint_frames:
-                                        self._waypoint_frames[dev_id] = {}
-
-                                    if transaction_id not in self._waypoint_frames[dev_id]:
-                                        self._waypoint_frames[dev_id][transaction_id] = {
-                                            'frames': {},
-                                            'total': total_frame,
-                                            'area': getattr(cover_path, 'area', None),
-                                            'data_hash': getattr(cover_path, 'data_hash', None)
-                                        }
-
-                                    # Store this frame's data
-                                    path_packets = getattr(cover_path, 'path_packets', [])
-                                    self._waypoint_frames[dev_id][transaction_id]['frames'][current_frame] = {
-                                        'path_packets': path_packets,
-                                        'time': getattr(cover_path, 'time', None),
-                                        'valid_paths': getattr(cover_path, 'vaild_path_num', 0)
-                                        # Note: typo in source
-                                    }
-
-                                    self.logger.info(
-                                        f"🌾 Waypoint frame {current_frame}/{total_frame} for transaction {transaction_id}, packets={len(path_packets)}"
-                                    )
-
-                                    # Check if all frames received and process
-                                    frames_dict = self._waypoint_frames[dev_id][transaction_id]['frames']
-                                    if len(frames_dict) == total_frame:
-                                        self.logger.info(
-                                            f"✅ All {total_frame} waypoint frames received for transaction {transaction_id}"
-                                        )
-                                        # Process accumulated waypoints into mowing path
-                                        try:
-                                            self._process_waypoint_frames(dev_id, transaction_id, mgr, mower_name)
-                                        except Exception as ex:
-                                            self.logger.debug(f"Process waypoint frames failed: {ex}")
-
-                    except Exception as ex:
-                        self.logger.debug(f"Waypoint check error: {ex}")
-
-                    # Check for direct mow_path updates in map
-                    try:
-                        if hasattr(res, 'map'):
-                            self.logger.debug(f"📍 Has map attribute")
-                            map_data = res.map
-                            if hasattr(map_data, 'mow_path'):
-                                mow_path = map_data.mow_path
-                                if mow_path and hasattr(mow_path, 'path'):
-                                    path_points = getattr(mow_path, 'path', [])
-                                    if path_points:
-                                        self.logger.info(
-                                            f"🎯 Direct mow_path received with {len(path_points)} points")
-                                        # Store directly to the device's map
-                                        md = mgr.mower(mower_name)
-                                        if md:
-                                            if not hasattr(md, 'current_mow_path'):
-                                                md.current_mow_path = []
-                                            md.current_mow_path = path_points
-                    except Exception as ex:
-                        self.logger.debug(f"Direct mow_path check error: {ex}")
-
-                    # Check for work data with path info
-                    try:
-                        if hasattr(res, 'work'):
-                            work = res.work
-                            if hasattr(work, 'path_pos_x') and hasattr(work, 'path_pos_y'):
-                                self.logger.debug(
-                                    f"📍 Work has path position: x={work.path_pos_x}, y={work.path_pos_y}")
+                        if isinstance(res, tuple) and len(res) == 2:
+                            topic, payload = res
+                            self.logger.debug(
+                                f"🔔 Cloud notification: topic={topic}, payload_type={type(payload).__name__}"
+                            )
+                        else:
+                            self.logger.debug(f"🔔 Cloud notify: raw={type(res).__name__}")
                     except Exception:
-                        pass
+                        self.logger.debug(f"🔔 Cloud notify: unexpected res={res!r}")
 
-                    # Also detect when map names arrive so we don't keep requesting
-                    try:
-                        md = mgr.mower(mower_name)
-                        m = getattr(md, "map", None)
-                        names = getattr(m, "area_name", []) if m else []
-                        if names and len(names) > 0:
-                            if not self._area_names_ready.get(dev_id, False):
-                                self.logger.debug(f"Area names now present (count={len(names)}) for '{mower_name}'")
-                            self._area_names_ready[dev_id] = True
-                    except Exception:
-                        pass
-
+                    # Always trigger a refresh; state_manager has already updated the device
                     self._schedule_state_refresh(dev_id)
 
-                # SET THE CALLBACK ON device.cloud, NOT cloud_client!
                 cloud.set_notification_callback(_cloud_notify)
-                self.logger.info(f"☁️ Cloud notification callback registered on device.cloud for '{mower_name}'")
+                self.logger.info(
+                    f"☁️ Cloud notification callback registered on device.cloud for '{mower_name}'"
+                )
 
-                # Set error callback
                 if hasattr(cloud, "set_error_callback"):
                     async def _cloud_error(exc):
                         if self._is_auth_error(exc):
@@ -1226,15 +1247,15 @@ class Plugin(indigo.PluginBase):
                             try:
                                 await self._cloud_relogin_once(dev_id)
                             except Exception as re:
-                                self.logger.debug(f"_cloud_error: relogin failed for '{mower_name}': {re}")
+                                self.logger.debug(
+                                    f"_cloud_error: relogin failed for '{mower_name}': {re}"
+                                )
 
-                    # Need to wrap async callback properly
                     def _cloud_error_wrapper(exc):
-                        """Wrapper to schedule async error handler"""
                         if self._event_loop and not self._event_loop.is_closed():
                             asyncio.run_coroutine_threadsafe(
                                 _cloud_error(exc),
-                                self._event_loop
+                                self._event_loop,
                             )
 
                     cloud.set_error_callback(_cloud_error_wrapper)
@@ -1242,18 +1263,66 @@ class Plugin(indigo.PluginBase):
                 self.logger.debug("device.cloud or set_notification_callback not available")
         except Exception as ex:
             self.logger.debug(f"Bind cloud notification failed: {ex}")
-
-            # Rest of the method remains the same...
-
         # Bind state_manager callbacks (properties/status/device events)
+        # Bind state_manager callbacks (properties/status/device events) – HA parity
         try:
             sm = getattr(device, "state_manager", None)
-            if sm and hasattr(sm, "properties_callback"):
-                sm.properties_callback.add_subscribers(lambda p: self._schedule_state_refresh(dev_id))
-            if sm and hasattr(sm, "status_callback"):
-                sm.status_callback.add_subscribers(lambda s: self._schedule_state_refresh(dev_id))
-            if sm and hasattr(sm, "device_event_callback"):
-                sm.device_event_callback.add_subscribers(lambda e: self._schedule_state_refresh(dev_id))
+            self.logger.debug(
+                f"[SM-bind] device.state_manager={sm!r} type={type(sm).__name__ if sm else None}"
+            )
+
+            props_cb = getattr(sm, "properties_callback", None) if sm else None
+            status_cb = getattr(sm, "status_callback", None) if sm else None
+            event_cb = getattr(sm, "device_event_callback", None) if sm else None
+
+            self.logger.debug(
+                f"[SM-bind] props_cb={props_cb!r} type={type(props_cb).__name__ if props_cb else None}, "
+                f"status_cb={status_cb!r} type={type(status_cb).__name__ if status_cb else None}, "
+                f"event_cb={event_cb!r} type={type(event_cb).__name__ if event_cb else None}"
+            )
+
+            if props_cb is not None:
+                add_sub = getattr(props_cb, "add_subscribers", None)
+                self.logger.debug(
+                    f"[SM-bind] props_cb.add_subscribers present={callable(add_sub)}"
+                )
+                if callable(add_sub):
+                    try:
+                        add_sub(lambda p: asyncio.run_coroutine_threadsafe(
+                            self._sm_update_properties(dev_id, p), self._event_loop
+                        ))
+                        self.logger.debug("[SM-bind] properties_callback subscriber attached")
+                    except Exception as ex:
+                        self.logger.debug(f"[SM-bind] properties_callback add_subscribers failed: {ex}")
+
+            if status_cb is not None:
+                add_sub = getattr(status_cb, "add_subscribers", None)
+                self.logger.debug(
+                    f"[SM-bind] status_cb.add_subscribers present={callable(add_sub)}"
+                )
+                if callable(add_sub):
+                    try:
+                        add_sub(lambda s: asyncio.run_coroutine_threadsafe(
+                            self._sm_update_status(dev_id, s), self._event_loop
+                        ))
+                        self.logger.debug("[SM-bind] status_callback subscriber attached")
+                    except Exception as ex:
+                        self.logger.debug(f"[SM-bind] status_callback add_subscribers failed: {ex}")
+
+            if event_cb is not None:
+                add_sub = getattr(event_cb, "add_subscribers", None)
+                self.logger.debug(
+                    f"[SM-bind] event_cb.add_subscribers present={callable(add_sub)}"
+                )
+                if callable(add_sub):
+                    try:
+                        add_sub(lambda e: asyncio.run_coroutine_threadsafe(
+                            self._sm_update_event(dev_id, e), self._event_loop
+                        ))
+                        self.logger.debug("[SM-bind] device_event_callback subscriber attached")
+                    except Exception as ex:
+                        self.logger.debug(f"[SM-bind] device_event_callback add_subscribers failed: {ex}")
+
         except Exception as ex:
             self.logger.debug(f"Bind state_manager callbacks failed: {ex}")
 
@@ -1298,7 +1367,36 @@ class Plugin(indigo.PluginBase):
         except Exception as ex:
             self.logger.debug(f"Area-name request scheduling failed: {ex}")
 
+###
+    async def _sm_update_properties(self, dev_id: int, properties):
+        """HA-style state_manager properties callback."""
+        try:
+            self.logger.debug(
+                f"[SM] properties_callback fired for dev_id={dev_id}, type={type(properties).__name__}"
+            )
+        except Exception:
+            pass
+        self._schedule_state_refresh(dev_id)
 
+    async def _sm_update_status(self, dev_id: int, status):
+        """HA-style state_manager status callback."""
+        try:
+            self.logger.debug(
+                f"[SM] status_callback fired for dev_id={dev_id}, type={type(status).__name__}"
+            )
+        except Exception:
+            pass
+        self._schedule_state_refresh(dev_id)
+
+    async def _sm_update_event(self, dev_id: int, event):
+        """HA-style state_manager device_event callback."""
+        try:
+            self.logger.debug(
+                f"[SM] device_event_callback fired for dev_id={dev_id}, type={type(event).__name__}"
+            )
+        except Exception:
+            pass
+        self._schedule_state_refresh(dev_id)
 
     # ========== Schedule a safe refresh from callbacks ==========
     def _schedule_state_refresh(self, dev_id: int):
@@ -2085,11 +2183,11 @@ class Plugin(indigo.PluginBase):
 
             await _do_send()
 
-            if key not in nosync:
-                with contextlib.suppress(Exception):
-                    await mgr.start_sync(name, retry=1)
-            else:
-                self.logger.debug(f"Skip sync for movement key={key}")
+      #      if key not in nosync:
+      #          with contextlib.suppress(Exception):
+      ##              await mgr.start_sync(name, retry=1)
+       ##     else:
+        #        self.logger.debug(f"Skip sync for movement key={key}")
 
             self._set_status(dev_id, f"Command sent: {key}")
 
@@ -3198,11 +3296,12 @@ class Plugin(indigo.PluginBase):
             self.logger.warning(f"'{dev.name}': no mower selected")
             return
         try:
-            mgr = Mammotion()
-            mowing_device = mgr.mower(name)
-            if mowing_device is None:
-                self.logger.warning(f"'{dev.name}': mower object not available")
+            mgr = self._mgr.get(dev.id)
+            if not mgr:
+                self.logger.warning(f"'{dev.name}': manager not ready")
                 return
+
+            mowing_device = mgr.mower(name)
 
             def summarize(obj, max_list=10, max_str=120):
                 """Return a dict of scalar fields and short lists only."""
