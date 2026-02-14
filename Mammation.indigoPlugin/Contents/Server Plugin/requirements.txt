@@ -17,3 +17,4 @@ cryptography>=43.0.1
 crcmod~=1.7
 pyjwt>=2.10.1
 shapely
+aiohttp
