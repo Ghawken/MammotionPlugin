@@ -2,7 +2,8 @@
 
 # version of Luba API
 # TODO export the three interface types
-__version__ = "0.0.5"
+# Vendored from mikey0000/pymammotion @ tag v0.5.76 (sha 76993821).
+__version__ = "0.5.76"
 
 import asyncio
 import logging

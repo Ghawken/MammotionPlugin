@@ -20,7 +20,9 @@ class MammotionRTKCloudDevice(MammotionRTKDevice):
     """RTK device with cloud connectivity - simpler than mowers, no map sync."""
 
     def __init__(self, mqtt: MammotionCloud, cloud_device: Device, rtk_state: RTKDevice) -> None:
-        """Initialize MammotionRTKCloudDevice."""
+        """Initialize MammotionRTKCloudDevice.
+        :rtype: None
+        """
         super().__init__(cloud_device, rtk_state)
         self.stopped = False
         self.on_ready_callback: Callable[[], Awaitable[None]] | None = None
@@ -53,7 +55,7 @@ class MammotionRTKCloudDevice(MammotionRTKDevice):
         return self._mqtt.command_sent_time
 
     @property
-    def mqtt(self):
+    def mqtt(self) -> MammotionCloud:
         return self._mqtt
 
     async def on_ready(self) -> None:
@@ -70,7 +72,7 @@ class MammotionRTKCloudDevice(MammotionRTKDevice):
     async def on_connect(self) -> None:
         """Callback for when MQTT connects."""
 
-    async def stop(self) -> None:
+    def stop(self) -> None:
         """Stop all tasks and disconnect."""
         self.stopped = True
 
@@ -88,7 +90,7 @@ class MammotionRTKCloudDevice(MammotionRTKDevice):
         command_bytes = getattr(self._commands, key)(**kwargs)
         await self._mqtt.command_queue.put((self.iot_id, key, command_bytes, future))
         try:
-            return await future
+            await future
         except asyncio.CancelledError:
             """Try again once."""
             future = asyncio.Future()

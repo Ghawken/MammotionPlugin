@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from logging import getLogger
 from typing import Any
 
+from aiohttp import ClientSession
+
 from pymammotion.aliyun.cloud_gateway import (
     EXPIRED_CREDENTIAL_EXCEPTIONS,
     DeviceOfflineException,
@@ -15,9 +17,11 @@ from pymammotion.aliyun.cloud_gateway import (
 from pymammotion.data.model import GenerateRouteInformation
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.data.model.device_config import OperationSettings, create_path_order
+from pymammotion.data.model.device_limits import DeviceLimits
 from pymammotion.mammotion.devices import MammotionMowerDeviceManager
 from pymammotion.mammotion.devices.mammotion import Mammotion
 from pymammotion.proto import RptAct, RptInfoType
+from pymammotion.utility.device_config import DeviceConfig
 from pymammotion.utility.device_type import DeviceType
 
 logger = getLogger(__name__)
@@ -26,10 +30,11 @@ logger = getLogger(__name__)
 class HomeAssistantMowerApi:
     """API for interacting with Mammotion Mowers for Home Assistant."""
 
-    def __init__(self) -> None:
+    def __init__(self, session: ClientSession | None = None) -> None:
+        self._device_config = DeviceConfig()
         self._plan_lock = asyncio.Lock()
         self.update_failures = 0
-        self._mammotion = Mammotion()
+        self._mammotion = Mammotion(session)
         self._map_lock = asyncio.Lock()
         self._last_call_times: dict[str, datetime] = {}
         self._call_intervals = {
@@ -39,7 +44,8 @@ class HomeAssistantMowerApi:
             "get_errors": timedelta(minutes=1),
             "get_report_cfg": timedelta(seconds=5),
             "get_maintenance": timedelta(minutes=30),
-            "device_version_upgrade": timedelta(hours=5),
+            "device_version_upgrade": timedelta(hours=24),
+            "device_info": timedelta(hours=24),
         }
 
     @property
@@ -66,6 +72,10 @@ class HomeAssistantMowerApi:
     def _mark_api_called(self, api_name: str) -> None:
         """Mark an API as called with the current timestamp."""
         self._last_call_times[api_name] = datetime.now()
+
+    def device_limits(self, device_name: str) -> DeviceLimits:
+        device = self._mammotion.get_device_by_name(device_name)
+        return self._device_config.get_best_default(device.state.mower_state.product_key)
 
     async def update(self, device_name: str) -> MowingDevice:
         device = self._mammotion.get_device_by_name(device_name)
@@ -117,7 +127,11 @@ class HomeAssistantMowerApi:
             self._mark_api_called("get_maintenance")
 
         if self._should_call_api("device_version_upgrade"):
+            await self.async_check_firmware_version(device_name)
             self._mark_api_called("device_version_upgrade")
+
+        if self._should_call_api("device_info"):
+            await self.async_device_info(device_name)
 
         return device.state
 
@@ -227,6 +241,7 @@ class HomeAssistantMowerApi:
                 blade_height = 0
 
             await self.async_send_command(
+                device_name,
                 "operate_on_device",
                 main_ctrl=1,
                 cut_knife_ctrl=1,
@@ -235,6 +250,7 @@ class HomeAssistantMowerApi:
             )
         else:
             await self.async_send_command(
+                device_name,
                 "operate_on_device",
                 main_ctrl=0,
                 cut_knife_ctrl=0,
@@ -482,3 +498,24 @@ class HomeAssistantMowerApi:
         if cloud := device.cloud:
             if cloud.stopped:
                 await cloud.start()
+
+    async def async_check_firmware_version(self, device_name: str) -> None:
+        """Checks firmware version."""
+        device = self.mammotion.get_device_by_name(device_name)
+        ota_info = await device.mammotion_http.get_device_ota_firmware([device.iot_id])
+        logger.debug("OTA info: %s", ota_info.data)
+        if check_versions := ota_info.data:
+            for check_version in check_versions:
+                if check_version.device_id == device.iot_id:
+                    device.state.update_check = check_version
+
+    async def async_device_info(self, device_name) -> None:
+        """Get device info."""
+        command_list = [
+            "get_device_version_main",
+            "get_device_version_info",
+            "get_device_base_info",
+            "get_device_product_model",
+        ]
+        for command in command_list:
+            await self.async_send_command(device_name, command)

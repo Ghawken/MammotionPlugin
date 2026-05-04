@@ -32,10 +32,14 @@ class ErrorInfo(DataClassDictMixin):
     fr_solution: str
     it_implication: str
     it_solution: str
+    ja_implication: str
+    ja_solution: str
     es_implication: str
     es_solution: str
     cs_implication: str
     cs_solution: str
+    ko_implication: str
+    ko_solution: str
     sk_implication: str
     sk_solution: str
     pl_implication: str
@@ -108,6 +112,9 @@ class DeviceInfo:
     active_timestamp: Annotated[int, Alias("activeTimestamp")] = 0
     location_vo: Annotated[LocationVo | None, Alias("locationVo")] = None
 
+    class Config(BaseConfig):
+        allow_deserialization_not_by_alias = True
+
 
 @dataclass
 class DeviceRecord(DataClassORJSONMixin):
@@ -119,6 +126,9 @@ class DeviceRecord(DataClassORJSONMixin):
     status: int
     bind_time: Annotated[int, Alias("bindTime")]
     create_time: Annotated[str, Alias("createTime")]
+
+    class Config(BaseConfig):
+        allow_deserialization_not_by_alias = True
 
 
 @dataclass
@@ -193,12 +203,18 @@ class FirmwareVersions(DataClassORJSONMixin):
     firmware_latest_version: Annotated[str, Alias("firmwareLatestVersion")] = ""
     firmware_type: Annotated[str, Alias("firmwareType")] = ""
 
+    class Config(BaseConfig):
+        allow_deserialization_not_by_alias = True
+
 
 @dataclass
 class ProductVersionInfo(DataClassORJSONMixin):
     release_note: Annotated[str, Alias("releaseNote")] = ""
     release_version: Annotated[str, Alias("releaseVersion")] = ""
     data_location: str | None = None
+
+    class Config(BaseConfig):
+        allow_deserialization_not_by_alias = True
 
 
 @dataclass
@@ -212,6 +228,9 @@ class CheckDeviceVersion(DataClassORJSONMixin):
     current_version: Annotated[str, Alias("currentVersion")] = ""
     isupgrading: bool | None = False
     cause_msg: Annotated[str, Alias("causeMsg")] = ""
+
+    class Config(BaseConfig):
+        allow_deserialization_not_by_alias = True
 
     def __eq__(self, other):
         if not isinstance(other, CheckDeviceVersion):

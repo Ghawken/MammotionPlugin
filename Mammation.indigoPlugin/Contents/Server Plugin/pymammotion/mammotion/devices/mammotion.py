@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
+from aiohttp import ClientSession
 from bleak import BLEDevice
 
 from pymammotion import MammotionMQTT
@@ -39,6 +40,13 @@ class MammotionDeviceManager:
     def __init__(self) -> None:
         self.devices: dict[str, MammotionMowerDeviceManager] = {}
         self.rtk_devices: dict[str, MammotionRTKDeviceManager] = {}
+
+    async def stop(self) -> None:
+        for mower in self.devices.values():
+            if cloud := mower.cloud:
+                cloud.stop()
+            if ble := mower.ble:
+                await ble.stop()
 
     def _should_disconnect_mqtt(self, device_for_removal: AbstractDeviceManager) -> bool:
         """Check if MQTT connection should be disconnected.
@@ -107,6 +115,13 @@ class MammotionDeviceManager:
         """Get a mower device."""
         return self.devices[mammotion_device_name]
 
+    def get_device_by_iot_id(self, iot_id: str) -> MammotionMowerDeviceManager | None:
+        """Get a mower device by IoT ID."""
+        for device in self.devices.values():
+            if device.iot_id == iot_id:
+                return device
+        return None
+
     def get_rtk_device(self, rtk_device_name: str) -> MammotionRTKDeviceManager:
         """Get an RTK device."""
         return self.rtk_devices[rtk_device_name]
@@ -120,7 +135,7 @@ class MammotionDeviceManager:
             if device_for_removal.cloud:
                 if self._should_disconnect_mqtt(device_for_removal):
                     await loop.run_in_executor(None, device_for_removal.cloud.mqtt.disconnect)
-                await device_for_removal.cloud.stop()
+                    device_for_removal.cloud.stop()
 
             if device_for_removal.ble:
                 await device_for_removal.ble.stop()
@@ -136,7 +151,7 @@ class MammotionDeviceManager:
             if device_for_removal.cloud:
                 if self._should_disconnect_mqtt(device_for_removal):
                     await loop.run_in_executor(None, device_for_removal.cloud.mqtt.disconnect)
-                await device_for_removal.cloud.stop()
+                    device_for_removal.cloud.stop()
 
             if device_for_removal.ble:
                 await device_for_removal.ble.stop()
@@ -157,12 +172,13 @@ class Mammotion:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self) -> None:
+    def __init__(self, session: ClientSession | None = None) -> None:
         """Initialize MammotionDevice."""
         self._login_lock = asyncio.Lock()
+        self._session: ClientSession | None = session
         self.mqtt_list: dict[str, MammotionCloud] = {}
 
-    async def login_and_initiate_cloud(self, account, password, force: bool = False) -> None:
+    async def login_and_initiate_cloud(self, account: str, password: str, force: bool = False) -> None:
         async with self._login_lock:
             exists_aliyun: MammotionCloud | None = self.mqtt_list.get(f"{account}_aliyun")
             exists_mammotion: MammotionCloud | None = self.mqtt_list.get(f"{account}_mammotion")
@@ -186,9 +202,15 @@ class Mammotion:
 
             await mammotion_http.refresh_login()
 
-            await self.connect_iot(exists_aliyun.cloud_client)
             if len(mammotion_http.device_records.records) != 0:
                 await mammotion_http.get_mqtt_credentials()
+
+            if exists_aliyun and exists_aliyun.is_connected():
+                exists_aliyun.disconnect()
+                await self.connect_iot(exists_aliyun.cloud_client)
+
+            if exists_mammotion and exists_mammotion.is_connected():
+                exists_mammotion.disconnect()
 
             if exists_aliyun and not exists_aliyun.is_connected():
                 loop = asyncio.get_running_loop()
@@ -237,7 +259,7 @@ class Mammotion:
                                 cloud_device=device,
                                 ble_device=ble_device,
                                 preference=ConnectionPreference.BLUETOOTH,
-                                cloud_client=CloudIOTGateway(MammotionHTTP()),
+                                cloud_client=CloudIOTGateway(MammotionHTTP(session=self._session)),
                             )
                         )
                     else:
@@ -251,7 +273,7 @@ class Mammotion:
                                 cloud_device=device,
                                 ble_device=ble_device,
                                 preference=ConnectionPreference.BLUETOOTH,
-                                cloud_client=CloudIOTGateway(MammotionHTTP()),
+                                cloud_client=CloudIOTGateway(MammotionHTTP(session=self._session)),
                             )
                         )
                     else:
@@ -288,7 +310,7 @@ class Mammotion:
             self.add_cloud_devices(mammotion_cloud)
 
             await loop.run_in_executor(None, self.mqtt_list[f"{account}_aliyun"].connect_async)
-        if len(mammotion_http.device_records.records) != 0:
+        if len(mammotion_http.device_records.records) != 0 and mammotion_http.mqtt_credentials is not None:
             mammotion_cloud = MammotionCloud(
                 MammotionMQTT(
                     records=mammotion_http.device_records.records,
@@ -408,7 +430,7 @@ class Mammotion:
 
     async def login(self, account: str, password: str) -> CloudIOTGateway:
         """Login to mammotion cloud."""
-        mammotion_http = MammotionHTTP()
+        mammotion_http = MammotionHTTP(session=self._session)
         await mammotion_http.login_v2(account, password)
         await mammotion_http.get_user_device_page()
         device_list = await mammotion_http.get_user_device_list()
@@ -417,6 +439,12 @@ class Mammotion:
         cloud_client = CloudIOTGateway(mammotion_http)
         await self.connect_iot(cloud_client)
         return cloud_client
+
+    async def stop(self) -> None:
+        await self.device_manager.stop()
+        for mqtt in self.mqtt_list.values():
+            if mqtt.is_connected():
+                mqtt.disconnect()
 
     @staticmethod
     async def connect_iot(cloud_client: CloudIOTGateway) -> None:
@@ -456,7 +484,9 @@ class Mammotion:
         mow_device = MammotionMowerDeviceManager(
             name=device.device_name,
             iot_id=device.iot_id,
-            cloud_client=mqtt_client.cloud_client if mqtt_client else CloudIOTGateway(MammotionHTTP()),
+            cloud_client=mqtt_client.cloud_client
+            if mqtt_client
+            else CloudIOTGateway(MammotionHTTP(session=self._session)),
             mqtt=mqtt_client,
             cloud_device=device,
             ble_device=ble_device,
@@ -512,16 +542,11 @@ class Mammotion:
     async def get_stream_subscription(self, name: str, iot_id: str) -> Response[StreamSubscriptionResponse] | Any:
         """Get stream subscription."""
         device = self.get_device_by_name(name)
-        if DeviceType.is_mini_or_x_series(name):
-            _stream_response = await device.mammotion_http.get_stream_subscription_mini_or_x_series(
-                iot_id, DeviceType.is_yuka(name) and not DeviceType.is_yuka_mini(name)
-            )
-            _LOGGER.debug(_stream_response)
-            return _stream_response
-        else:
-            _stream_response = await device.mammotion_http.get_stream_subscription(iot_id)
-            _LOGGER.debug(_stream_response)
-            return _stream_response
+        _stream_response = await device.mammotion_http.get_stream_subscription(
+            iot_id, DeviceType.is_yuka(name) and not DeviceType.is_yuka_mini(name)
+        )
+        _LOGGER.debug(_stream_response)
+        return _stream_response
 
     async def get_video_resource(self, name: str, iot_id: str) -> Response[VideoResourceResponse] | None:
         """Get video resource."""

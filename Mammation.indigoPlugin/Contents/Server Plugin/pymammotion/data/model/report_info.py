@@ -47,6 +47,15 @@ class VioSurvivalInfo(DataClassORJSONMixin):
 
 
 @dataclass
+class FpvInfo(DataClassORJSONMixin):
+    """fpv_flag: 0: no fpv, 1: fpv ok, 2: fpv error"""
+
+    fpv_flag: int = 0
+    wifi_available: int = 0
+    mobile_net_available: int = 0
+
+
+@dataclass
 class DeviceData(DataClassORJSONMixin):
     sys_status: int = 0
     charge_state: int = 0
@@ -58,7 +67,19 @@ class DeviceData(DataClassORJSONMixin):
     mnet_info: MnetInfo = field(default_factory=MnetInfo)
     vio_survival_info: VioSurvivalInfo = field(default_factory=VioSurvivalInfo)
     collector_status: CollectorStatus = field(default_factory=CollectorStatus)
+    fpv_info: FpvInfo | None = None
     lock_state: LockStateT = field(default_factory=LockStateT)
+
+
+@dataclass
+class RTKDisStatus(DataClassORJSONMixin):
+    pos_status: int = 0
+    precision: int = 0
+    device_signal: int = 0
+    l1: int = 0
+    l2: int = 0
+    connection_to_ref: int = 0
+    rtk_signal: int = 0
 
 
 @dataclass
@@ -66,8 +87,19 @@ class RTKData(DataClassORJSONMixin):
     status: int = 0
     pos_level: int = 0
     gps_stars: int = 0
-    dis_status: str = ""
+    dis_status: int = 0
     co_view_stars: int = 0
+
+    def get_dis_status(self) -> RTKDisStatus:
+        rtk_dis_status = RTKDisStatus()
+        rtk_dis_status.pos_status = ((int)(self.dis_status >> 8)) & 255
+        rtk_dis_status.precision = ((int)(self.dis_status >> 56)) & 255
+        rtk_dis_status.device_signal = ((int)(self.dis_status >> 32)) & 255
+        rtk_dis_status.l1 = ((int)(self.dis_status >> 16)) & 255
+        rtk_dis_status.l2 = ((int)(self.dis_status >> 24)) & 255
+        rtk_dis_status.connection_to_ref = ((int)(self.dis_status >> 48)) & 255
+        rtk_dis_status.rtk_signal = ((int)(self.dis_status >> 40)) & 255
+        return rtk_dis_status
 
 
 @dataclass
@@ -76,7 +108,7 @@ class LocationData(DataClassORJSONMixin):
     real_pos_y: int = 0
     real_toward: int = 0
     pos_type: int = 0
-    bol_hash: str = ""
+    bol_hash: int = 0
 
 
 @dataclass
@@ -105,27 +137,35 @@ class VisionInfo(DataClassORJSONMixin):
 
 
 @dataclass
+class HeadingState(DataClassORJSONMixin):
+    heading_state: int = 0
+
+
+@dataclass
 class WorkData(DataClassORJSONMixin):
     path: int = 0
-    path_hash: str = ""
+    path_hash: int = 0
     progress: int = 0
     area: int = 0
     bp_info: int = 0
-    bp_hash: str = ""
+    bp_hash: int = 0
     bp_pos_x: int = 0
     bp_pos_y: int = 0
-    real_path_num: str = ""
+    real_path_num: int = 0
     path_pos_x: int = 0
     path_pos_y: int = 0
-    ub_zone_hash: str = ""
-    ub_path_hash: str = ""
-    init_cfg_hash: str = ""
-    ub_ecode_hash: str = ""
+    ub_zone_hash: int = 0
+    ub_path_hash: int = 0
+    init_cfg_hash: int = 0
+    ub_ecode_hash: int = 0
     nav_run_mode: int = 0
     test_mode_status: int = 0
     man_run_speed: int = 0
     nav_edit_status: int = 0
     knife_height: int = 0
+    nav_heading_state: HeadingState = field(default_factory=HeadingState)
+    cutter_offset: float = 0.0
+    cutter_width: float = 0.0
 
 
 @dataclass

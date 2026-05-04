@@ -1,8 +1,9 @@
 import asyncio
+from asyncio import TimerHandle
 from collections.abc import Awaitable, Callable
 import logging
 import time
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import betterproto2
@@ -20,7 +21,7 @@ from pymammotion.bluetooth import BleMessage
 from pymammotion.data.mower_state_manager import MowerStateManager
 from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
 from pymammotion.mammotion.devices.base import MammotionBaseDevice
-from pymammotion.proto import LubaMsg
+from pymammotion.proto import DevNet, LubaMsg
 
 DBUS_ERROR_BACKOFF_TIME = 0.25
 
@@ -81,9 +82,9 @@ class MammotionBaseBLEDevice(MammotionBaseDevice):
     ) -> None:
         """Initialize MammotionBaseBLEDevice."""
         super().__init__(state_manager, cloud_device)
-        self.command_sent_time = 0
+        self.command_sent_time: float = 0.0
         self._disconnect_strategy = True
-        self._ble_sync_task = None
+        self._ble_sync_task: TimerHandle | None = None
         self._prev_notification = None
         self._interface = f"hci{interface}"
         self.ble_device = device
@@ -92,7 +93,7 @@ class MammotionBaseBLEDevice(MammotionBaseDevice):
         self._write_char: BleakGATTCharacteristic | int | str | UUID = 0
         self._disconnect_timer: asyncio.TimerHandle | None = None
         self._message: BleMessage | None = None
-        self._commands: MammotionCommand = MammotionCommand(device.name, 1)
+        self._commands: MammotionCommand = MammotionCommand(device.name or "", 1)
         self.command_queue = asyncio.Queue()
         self._expected_disconnect = False
         self._connect_lock = asyncio.Lock()
@@ -165,9 +166,9 @@ class MammotionBaseBLEDevice(MammotionBaseDevice):
             key, command, future = await self.command_queue.get()
             try:
                 # Process the command using _execute_command_locked
-                result = await self._send_command_locked(key, command)
+                await self._send_command_locked(key, command)
                 # Set the result on the future
-                future.set_result(result)
+                future.set_result(None)
             except Exception as ex:
                 # Set the exception on the future if something goes wrong
                 future.set_exception(ex)
@@ -175,7 +176,7 @@ class MammotionBaseBLEDevice(MammotionBaseDevice):
                 # Mark the task as done
                 self.command_queue.task_done()
 
-    async def _send_command_with_args(self, key: str, **kwargs) -> bytes | None:
+    async def _send_command_with_args(self, key: str, **kwargs) -> None:
         """Send command to device and read response."""
         if self._operation_lock.locked():
             _LOGGER.debug(
@@ -206,7 +207,7 @@ class MammotionBaseBLEDevice(MammotionBaseDevice):
                 _LOGGER.debug("%s: communication failed with:", self.name, exc_info=True)
         return
 
-    async def _send_command(self, key: str, retry: int | None = None) -> bytes | None:
+    async def _send_command(self, key: str, retry: int | None = None) -> None:
         """Send command to device and read response."""
         if self._operation_lock.locked():
             _LOGGER.debug(
@@ -339,7 +340,7 @@ class MammotionBaseBLEDevice(MammotionBaseDevice):
             await self._execute_forced_disconnect()
             raise
 
-    async def _notification_handler(self, _sender: BleakGATTCharacteristic, data: bytearray) -> None:
+    async def _notification_handler(self, _sender: BleakGATTCharacteristic, data: bytes) -> None:
         """Handle notification responses."""
 
         if self._message is None:
@@ -361,14 +362,12 @@ class MammotionBaseBLEDevice(MammotionBaseDevice):
         new_msg = LubaMsg().parse(data)
         res = betterproto2.which_one_of(new_msg, "LubaSubMsg")
         if res[0] == "net":
-            if new_msg.net.todev_ble_sync != 0 or new_msg.net.toapp_wifi_iot_status is not None:
-                if new_msg.net.toapp_wifi_iot_status is not None and self._commands.get_device_product_key() == "":
-                    self._commands.set_device_product_key(new_msg.net.toapp_wifi_iot_status.productkey)
+            dev_net: DevNet = cast(DevNet, res[1])
+            if dev_net.todev_ble_sync != 0 or dev_net.toapp_wifi_iot_status is not None:
+                if dev_net.toapp_wifi_iot_status is not None and self._commands.get_device_product_key() == "":
+                    self._commands.set_device_product_key(dev_net.toapp_wifi_iot_status.productkey)
 
         await self._state_manager.notification(new_msg)
-
-        if self._execute_timed_disconnect is None:
-            await self._execute_forced_disconnect()
 
         self._reset_disconnect_timer()
 

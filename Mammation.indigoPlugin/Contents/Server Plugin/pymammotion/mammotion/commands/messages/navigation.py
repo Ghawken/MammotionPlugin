@@ -4,7 +4,7 @@ import logging
 import time
 
 from pymammotion.data.model import GenerateRouteInformation
-from pymammotion.data.model.hash_list import Plan
+from pymammotion.data.model.hash_list import Plan, SvgMessage
 from pymammotion.data.model.region_data import RegionData
 from pymammotion.mammotion.commands.abstract_message import AbstractMessage
 from pymammotion.proto import (
@@ -25,6 +25,8 @@ from pymammotion.proto import (
     NavUnableTimeSet,
     NavUploadZigZagResultAck,
     SimulationCmdData,
+    SvgMessageAckT,
+    SvgMessageT,
     WorkReportCmdData,
     WorkReportUpdateCmd,
 )
@@ -415,7 +417,8 @@ class MessageNavigation(AbstractMessage, ABC):
             reserved=generate_route_information.path_order,
         )
         logger.debug(f"{self.get_device_name()}Generate route====={build}")
-        logger.debug(f"Send command--Generate route information generateRouteInformation={generate_route_information}")
+        logger.debug(f"Send command--Generate route information generateRouteInformation={
+        generate_route_information}")
         return self.send_order_msg_nav(MctlNav(bidire_reqconver_path=build))
 
     def modify_route_information(self, generate_route_information: GenerateRouteInformation) -> bytes:
@@ -435,7 +438,8 @@ class MessageNavigation(AbstractMessage, ABC):
             reserved=generate_route_information.path_order,
         )
         logger.debug(f"{self.get_device_name()} Generate route ===== {build}")
-        logger.debug(f"Send command -- Modify route parameters generate_route_information={generate_route_information}")
+        logger.debug(f"Send command -- Modify route parameters generate_route_information={
+        generate_route_information}")
         return self.send_order_msg_nav(MctlNav(bidire_reqconver_path=build))
 
     def end_generate_route_information(self) -> bytes:
@@ -447,7 +451,8 @@ class MessageNavigation(AbstractMessage, ABC):
 
     def query_generate_route_information(self) -> bytes:
         build = NavReqCoverPath(pver=1, sub_cmd=2)
-        logger.debug(f"{self.get_device_name()} Send command -- Get route configuration information generate_route_information={build}")
+        logger.debug(f"{self.get_device_name(
+        )} Send command -- Get route configuration information generate_route_information={build}")
         build2 = MctlNav(bidire_reqconver_path=build)
         return self.send_order_msg_nav(build2)
 
@@ -525,4 +530,35 @@ class MessageNavigation(AbstractMessage, ABC):
     def reset_base_station(self) -> bytes:
         build = MctlNav(todev_taskctrl=NavTaskCtrl(type=3, action=1, result=0))
         logger.debug("Send command - Reset charging pile, base station position")
+        return self.send_order_msg_nav(build)
+
+    def send_svg_data(self, svg_message: SvgMessage) -> bytes:
+        """Send SVG data to the device."""
+        build = MctlNav(
+            todev_svg_msg=SvgMessageAckT(
+                pver=1,
+                sub_cmd=svg_message.sub_cmd,
+                total_frame=svg_message.total_frame,
+                current_frame=svg_message.current_frame,
+                data_hash=svg_message.data_hash,
+                paternal_hash_a=svg_message.paternal_hash_a,
+                result=svg_message.result,
+                svg_message=SvgMessageT(
+                    hide_svg=svg_message.svg_message.hide_svg,
+                    svg_file_data=svg_message.svg_message.svg_file_data,
+                    svg_file_name=svg_message.svg_message.svg_file_name,
+                    data_count=svg_message.svg_message.data_count,
+                    name_count=svg_message.svg_message.name_count,
+                    base_height_m=svg_message.svg_message.base_height_m,
+                    base_width_m=svg_message.svg_message.base_width_m,
+                    base_width_pix=svg_message.svg_message.base_width_pix,
+                    base_height_pix=svg_message.svg_message.base_height_pix,
+                    x_move=svg_message.svg_message.x_move,
+                    y_move=svg_message.svg_message.y_move,
+                    scale=svg_message.svg_message.scale,
+                    rotate=svg_message.svg_message.rotate,
+                ),
+            )
+        )
+
         return self.send_order_msg_nav(build)

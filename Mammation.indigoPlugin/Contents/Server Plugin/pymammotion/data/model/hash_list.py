@@ -17,6 +17,7 @@ class PathType(IntEnum):
     LINE = 10
     DUMP = 12
     SVG = 13
+    VISUAL_SAFETY_ZONE = 25
 
 
 @dataclass
@@ -94,9 +95,9 @@ class SvgMessageData(DataClassORJSONMixin):
     base_width_pix: int = 0
     base_height_m: float = 0.0
     base_height_pix: int = 0
+    name_count: int = 0
     data_count: int = 0
     hide_svg: bool = False
-    name_count: int = 0
     svg_file_name: str = ""
     svg_file_data: str = ""
 
@@ -207,20 +208,24 @@ class HashList(DataClassORJSONMixin):
     dump: dict[int, FrameList] = field(default_factory=dict)  # type 12? / sub cmd 4
     svg: dict[int, FrameList] = field(default_factory=dict)  # type 13
     line: dict[int, FrameList] = field(default_factory=dict)  # type 10 possibly breakpoint? / sub cmd 3
+    visual_safety_zone: dict[int, FrameList] = field(default_factory=dict)  # type 25
     plan: dict[str, Plan] = field(default_factory=dict)
     area_name: list[AreaHashNameList] = field(default_factory=list)
-    current_mow_path: dict[int, MowPath] = field(default_factory=dict)
+    current_mow_path: dict[int, dict[int, MowPath]] = field(default_factory=dict)
     generated_geojson: dict[str, Any] = field(default_factory=dict)
     generated_mow_path_geojson: dict[str, Any] = field(default_factory=dict)
 
-    def update_hash_lists(self, hashlist: list[int], bol_hash: str | None = None) -> None:
+    def update_hash_lists(self, hashlist: list[int], bol_hash: int | None = None) -> None:
         if bol_hash:
-            self.invalidate_maps(int(bol_hash))
+            self.invalidate_maps(bol_hash)
         self.area = {hash_id: frames for hash_id, frames in self.area.items() if hash_id in hashlist}
         self.path = {hash_id: frames for hash_id, frames in self.path.items() if hash_id in hashlist}
         self.obstacle = {hash_id: frames for hash_id, frames in self.obstacle.items() if hash_id in hashlist}
         self.dump = {hash_id: frames for hash_id, frames in self.dump.items() if hash_id in hashlist}
         self.svg = {hash_id: frames for hash_id, frames in self.svg.items() if hash_id in hashlist}
+        self.visual_safety_zone = {
+            hash_id: frames for hash_id, frames in self.visual_safety_zone.items() if hash_id in hashlist
+        }
 
         area_hashes = list(self.area.keys())
         for hash_id, plan_task in self.plan.copy().items():
@@ -258,7 +263,7 @@ class HashList(DataClassORJSONMixin):
     def missing_hashlist(self, sub_cmd: int = 0) -> list[int]:
         """Return missing hashlist."""
         all_hash_ids = set(self.area.keys()).union(
-            self.path.keys(), self.obstacle.keys(), self.dump.keys(), self.svg.keys()
+            self.path.keys(), self.obstacle.keys(), self.dump.keys(), self.svg.keys(), self.visual_safety_zone.keys()
         )
         if sub_cmd == 3:
             all_hash_ids = set(self.line.keys())
@@ -353,6 +358,7 @@ class HashList(DataClassORJSONMixin):
             PathType.LINE: self.line,
             PathType.DUMP: self.dump,
             PathType.SVG: self.svg,
+            PathType.VISUAL_SAFETY_ZONE: self.visual_safety_zone,
         }
 
     def update(self, hash_data: NavGetCommData | SvgMessage) -> bool:
@@ -375,34 +381,44 @@ class HashList(DataClassORJSONMixin):
 
         return False
 
-    def find_missing_mow_path_frames(self) -> list[int]:
-        """Find missing frames in current_mow_path based on total_frame."""
+    def find_missing_mow_path_frames(self) -> dict[int, list[int]]:
+        """Find missing frames in current_mow_path grouped by transaction_id.
+
+        Returns a mapping of transaction_id -> list of missing frame numbers.
+        Only transaction_ids with at least one missing frame are included.
+        """
+        missing_frames: dict[int, list[int]] = {}
+
         if not self.current_mow_path:
-            return []
+            return missing_frames
 
-        # Get total_frame from any MowPath object (they should all have the same total_frame)
-        total_frame = next(iter(self.current_mow_path.values())).total_frame
+        for transaction_id, frames_by_index in self.current_mow_path.items():
+            if not frames_by_index:
+                continue
 
-        if total_frame == 0:
-            return []
+            # Get total_frame from any MowPath object for this transaction_id
+            any_mow_path = next(iter(frames_by_index.values()))
+            total_frame = any_mow_path.total_frame
 
-        if total_frame == len(self.current_mow_path):
-            return []
+            if total_frame == 0:
+                continue
 
-        # Generate list of expected frame numbers (1 to total_frame)
-        expected_frames = set(range(1, total_frame + 1))
+            expected_frames = set(range(1, total_frame + 1))
+            current_frames = set(frames_by_index.keys())
+            missing_for_transaction = sorted(expected_frames - current_frames)
 
-        # Get current frame numbers from dictionary keys
-        current_frames = set(self.current_mow_path.keys())
+            if missing_for_transaction:
+                missing_frames[transaction_id] = missing_for_transaction
 
-        # Return sorted list of missing frames
-        missing_frames = sorted(expected_frames - current_frames)
         return missing_frames
 
     def update_mow_path(self, path: MowPath) -> None:
         """Update the current_mow_path with the latest MowPath data."""
         # TODO check if we need to clear the current_mow_path first
-        self.current_mow_path[path.current_frame] = path
+        transaction_id = path.transaction_id
+        if transaction_id not in self.current_mow_path:
+            self.current_mow_path[transaction_id] = {}
+        self.current_mow_path[transaction_id][path.current_frame] = path
 
     @staticmethod
     def find_missing_frames(frame_list: FrameList | RootHashList | None) -> list[int]:

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Annotated, Literal
 
+from mashumaro.config import BaseConfig
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 from mashumaro.types import Alias
 
@@ -43,6 +44,9 @@ class Params(DataClassORJSONMixin):
     tenant_instance_id: Annotated[str, Alias("tenantInstanceId")]
     category_id: Annotated[int, Alias("categoryId")]
     status: Annotated[Status, Alias("status")]
+
+    class Config(BaseConfig):
+        allow_deserialization_not_by_alias = True
 
 
 @dataclass

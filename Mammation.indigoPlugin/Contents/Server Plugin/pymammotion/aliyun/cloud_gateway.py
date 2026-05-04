@@ -430,7 +430,7 @@ class CloudIOTGateway:
                 headers["content-type"],
                 headers["date"],
                 header,
-                f'loginByOauthRequest={json.dumps(_bodyParam, separators=(",", ":"))}',
+                f"loginByOauthRequest={json.dumps(_bodyParam, separators=(",", ":"))}",
             )
 
             hash_val = hmac.new(
@@ -553,7 +553,7 @@ class CloudIOTGateway:
         response_body_dict = self.parse_json_response(response_body_str)
         return response_body_dict
 
-    async def check_or_refresh_session(self):
+    async def check_or_refresh_session(self) -> None:
         """Check or refresh the session."""
         logger.debug("Trying to refresh token")
         config = Config(
@@ -894,6 +894,9 @@ class CloudIOTGateway:
                 raise SetupException(response_body_dict.get("code"), iot_id)
             if response_body_dict.get("code") == 6205:
                 raise DeviceOfflineException(response_body_dict.get("code"), iot_id)
+
+            if response_body_dict.get("code") == 6205:
+                raise CheckSessionException(response_body_dict.get("message"))
 
             if response_body_dict.get("code") == 460:
                 logger.debug("iotToken expired, must re-login.")

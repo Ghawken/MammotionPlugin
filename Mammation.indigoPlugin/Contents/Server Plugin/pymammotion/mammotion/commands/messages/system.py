@@ -14,6 +14,7 @@ from pymammotion.proto import (
     MsgAttr,
     MsgCmdType,
     MsgDevice,
+    RemoteResetReqT,
     ReportInfoCfg,
     RptAct,
     RptInfoType,
@@ -93,20 +94,25 @@ class MessageSystem(AbstractMessage, ABC):
                 end_hour=0,
                 end_min=0,
             )
-        logger.debug(f"Send read and write sidelight command is_sidelight:{is_sidelight}, operate:{operate}")
+        logger.debug(f"Send read and write sidelight command is_sidelight:{
+            is_sidelight}, operate:{operate}")
         build2 = MctlSys(todev_time_ctrl_light=build)
-        logger.debug(f"Send command - send read and write sidelight command is_sidelight:{is_sidelight}, operate:{operate}, timeCtrlLight:{build}")
+        logger.debug(f"Send command - send read and write sidelight command is_sidelight:{
+            is_sidelight}, operate:{operate}, timeCtrlLight:{build}")
         return self.send_order_msg_sys(build2)
 
     def test_tool_order_to_sys(self, sub_cmd: int, param_id: int, param_value: list[int]) -> bytes:
         build = MCtrlSimulationCmdData(sub_cmd=sub_cmd, param_id=param_id, param_value=param_value)
-        logger.debug(f"Send tool test command: subCmd={sub_cmd}, param_id:{param_id}, param_value={param_value}")
+        logger.debug(f"Send tool test command: subCmd={sub_cmd}, param_id:{
+            param_id}, param_value={param_value}")
         build2 = MctlSys(simulation_cmd=build)
-        logger.debug(f"Send tool test command: subCmd={sub_cmd}, param_id:{param_id}, param_value={param_value}")
+        logger.debug(f"Send tool test command: subCmd={sub_cmd}, param_id:{
+            param_id}, param_value={param_value}")
         return self.send_order_msg_sys(build2)
 
     def read_and_set_rtk_paring_code(self, op: int, cgf: str | None = None) -> bytes:
-        logger.debug(f"Send read and write base station configuration quality op:{op}, cgf:{cgf}")
+        logger.debug(f"Send read and write base station configuration quality op:{
+            op}, cgf:{cgf}")
         return self.send_order_msg_sys(MctlSys(todev_lora_cfg_req=LoraCfgReq(op=op, cfg=cgf)))
 
     def allpowerfull_rw(self, rw_id: int, context: int, rw: int) -> bytes:
@@ -186,7 +192,8 @@ class MessageSystem(AbstractMessage, ABC):
         i7 = calendar.second
         i8 = calendar.utcoffset().total_seconds() // 60 if calendar.utcoffset() else 0
         i9 = 1 if calendar.dst() else 0
-        logger.debug(f"Print time zone, time zone={i8}, daylight saving time={i9} week={i4}")
+        logger.debug(f"Print time zone, time zone={
+            i8}, daylight saving time={i9} week={i4}")
         build = MctlSys(
             todev_data_time=SysSetDateTime(
                 year=i,
@@ -201,7 +208,8 @@ class MessageSystem(AbstractMessage, ABC):
             )
         )
         logger.debug(
-            f"Send command - synchronize time zone={i8}, daylight saving time={i9} week={i4}, day:{i3}, month:{i2}, hours:{i5}, minutes:{i6}, seconds:{i7}, year={i}",
+            f"Send command - synchronize time zone={i8}, daylight saving time={i9} week={i4}, day:{
+            i3}, month:{i2}, hours:{i5}, minutes:{i6}, seconds:{i7}, year={i}",
             "Time synchronization",
             True,
         )
@@ -234,7 +242,8 @@ class MessageSystem(AbstractMessage, ABC):
                 count=count,
             )
         )
-        logger.debug(f"Send command==== IOT slim data Act {build.todev_report_cfg.act}")
+        logger.debug(f"Send command==== IOT slim data Act {
+            build.todev_report_cfg.act}")
         return self.send_order_msg_sys_legacy(build)
 
     def get_maintenance(self) -> bytes:
@@ -320,3 +329,21 @@ class MessageSystem(AbstractMessage, ABC):
             timestamp=round(time.time() * 1000),
         )
         return luba_msg.SerializeToString()
+
+    def remote_restart(self, force_reset: int = 1) -> bytes:
+        """Send a remote restart command.
+        force_reset: 0 - normal restart, 1 - force restart
+        Args:
+            force_reset: Force reset flag
+        """
+        mctl_sys = MctlSys(
+            to_dev_remote_reset=RemoteResetReqT(
+                magic=1916956532,
+                bizid=round(time.time() * 1000),
+                reset_mode=0,
+                force_reset=force_reset,
+                account=self.user_account,
+            )
+        )
+        logger.debug(f"Send command - remote restart command status={force_reset}")
+        return self.send_order_msg_sys(mctl_sys)
