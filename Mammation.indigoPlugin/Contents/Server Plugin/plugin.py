@@ -170,6 +170,15 @@ class Plugin(indigo.PluginBase):
             pm.setLevel(logging.NOTSET)  # inherit from root (DEBUG)
             pm.propagate = True          # bubble up to root (file handler) AND to any parent chain
 
+            # 3b. Also surface pymammotion records via IndigoLogHandler so library-level
+            #     errors (e.g. login response body, HTTP failures) are visible in the Indigo
+            #     UI console — not only in the file log. IndigoLogHandler lives on
+            #     self.logger ("Mammotion Mower") and would NOT receive pymammotion records
+            #     via simple root propagation, so attach it directly here.
+            if getattr(self, "indigo_log_handler", None) is not None and \
+                    self.indigo_log_handler not in pm.handlers:
+                pm.addHandler(self.indigo_log_handler)
+
             # 4. Emit a test line (will appear once) so you can confirm in file quickly.
             pm.debug("[LOGTEST] pymammotion logger attached (propagate=TRUE -> root)")
 
@@ -683,6 +692,10 @@ class Plugin(indigo.PluginBase):
                 pm = logging.getLogger("pymammotion")
                 pm.propagate = True
                 pm.setLevel(logging.NOTSET)
+                # Make sure our IndigoLogHandler is still attached so library
+                # ERROR/WARNING records remain visible in the Indigo UI.
+                if self.indigo_log_handler not in pm.handlers:
+                    pm.addHandler(self.indigo_log_handler)
                 self.logger.debug(
                     f"Logging prefs applied: Indigo={logging.getLevelName(self.indigo_log_handler.level)}, "
                     f"File={logging.getLevelName(self.plugin_file_handler.level)}"
