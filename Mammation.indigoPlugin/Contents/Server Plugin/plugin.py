@@ -478,17 +478,34 @@ class Plugin(indigo.PluginBase):
 
             def _patched_client_session(*args, **kwargs):
                 used_shim = False
+                base_url_value = None
                 if args and isinstance(args[0], str) and "base_url" not in kwargs:
-                    # Treat the first positional string as base_url
-                    kwargs["base_url"] = args[0]
+                    # Treat the first positional string as base_url. aiohttp>=3.9
+                    # requires base_url to be an absolute URL (with scheme), but
+                    # PyMammotion sometimes passes a bare host (e.g. jwt_info.iot
+                    # like "api-iot-business-eu-dcdn.mammotion.com"). Prepend
+                    # https:// in that case so aiohttp/yarl accepts it.
+                    candidate = args[0]
+                    if not candidate.startswith(("http://", "https://")):
+                        candidate = "https://" + candidate.lstrip("/")
+                    kwargs["base_url"] = candidate
+                    base_url_value = candidate
                     args = args[1:]
                     used_shim = True
                 try:
-                    return original_client_session(*args, **kwargs)
-                finally:
-                    # One-line, low-noise confirmation that the shim was applied
+                    session = original_client_session(*args, **kwargs)
+                except Exception:
                     if used_shim:
-                        shim_logger.debug("aiohttp shim applied (base_url set)")
+                        shim_logger.error(
+                            f"aiohttp shim failed to apply base_url={base_url_value!r}"
+                        )
+                    raise
+                if used_shim:
+                    # One-line, low-noise confirmation that the shim was applied
+                    shim_logger.debug(
+                        f"aiohttp shim applied (base_url set to {base_url_value!r})"
+                    )
+                return session
 
             # Patch global and module-local references
             aiohttp.ClientSession = _patched_client_session
@@ -925,7 +942,7 @@ class Plugin(indigo.PluginBase):
             except asyncio.CancelledError:
                 break
             except Exception as ex:
-                self.logger.error(f"Connection error for '{dev.name}': {ex}")
+                self.logger.error(f"Connection error for '{dev.name}': {ex}", exc_info=True)
                 self._set_basic(dev_id, connected=False, status=f"Error: {ex}")
             finally:
                 pt = self._periodic_tasks.pop(dev_id, None)
