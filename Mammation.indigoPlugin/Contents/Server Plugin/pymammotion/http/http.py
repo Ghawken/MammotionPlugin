@@ -7,9 +7,12 @@ from functools import wraps
 import hashlib
 import hmac
 import json
+import logging
 import random
 import time
 from typing import Any, TypeVar, cast
+
+_LOGGER = logging.getLogger(__name__)
 
 from aiohttp import ClientSession
 import jwt
@@ -143,6 +146,19 @@ class MammotionHTTP:
     @property
     def response(self) -> Response | None:
         return self._response
+
+    def _require_login_info(self) -> LoginResponseData:
+        """Return self.login_info, or raise a clear error if the client is not logged in.
+
+        Avoids cryptic ``AttributeError: 'NoneType' object has no attribute 'access_token'``
+        tracebacks when an upstream login attempt has silently failed.
+        """
+        if self.login_info is None:
+            raise UnauthorizedException(
+                "Mammotion HTTP client is not logged in (login_info is None); "
+                "the most recent login attempt failed before a token was issued."
+            )
+        return self.login_info
 
     @response.setter
     def response(self, response: Response) -> None:
@@ -473,9 +489,10 @@ class MammotionHTTP:
     @refresh_token_decorator
     async def get_user_device_page(self) -> Response[DeviceRecords]:
         """Fetches device list for a user, is either new API or for newer devices."""
-        async with ClientSession(self.jwt_info.iot) as session:
+        login_info = self._require_login_info()
+        async with ClientSession() as session:
             async with session.post(
-                "/v1/user/device/page",
+                f"{MAMMOTION_API_DOMAIN}/v1/user/device/page",
                 json={
                     "iotId": "",
                     "pageNumber": 1,
@@ -483,7 +500,7 @@ class MammotionHTTP:
                 },
                 headers={
                     **self._headers,
-                    "Authorization": f"Bearer {self.login_info.access_token}",
+                    "Authorization": f"Bearer {login_info.access_token}",
                     "Content-Type": "application/json",
                     "User-Agent": "okhttp/4.9.3",
                     "Client-Id": self.client_id,
@@ -500,12 +517,13 @@ class MammotionHTTP:
     @refresh_token_decorator
     async def get_mqtt_credentials(self) -> Response[MQTTConnection]:
         """Get mammotion mqtt credentials"""
-        async with ClientSession(self.jwt_info.iot) as session:
+        login_info = self._require_login_info()
+        async with ClientSession() as session:
             async with session.post(
-                "/v1/mqtt/auth/jwt",
+                f"{MAMMOTION_API_DOMAIN}/v1/mqtt/auth/jwt",
                 headers={
                     **self._headers,
-                    "Authorization": f"Bearer {self.login_info.access_token}",
+                    "Authorization": f"Bearer {login_info.access_token}",
                     "Content-Type": "application/json",
                     "User-Agent": "okhttp/4.9.3",
                 },
@@ -520,9 +538,10 @@ class MammotionHTTP:
     @refresh_token_decorator
     async def mqtt_invoke(self, content: str, device_name: str, iot_id: str) -> Response[dict]:
         """Send mqtt commands to devices."""
-        async with ClientSession(self.jwt_info.iot) as session:
+        login_info = self._require_login_info()
+        async with ClientSession() as session:
             async with session.post(
-                "/v1/mqtt/rpc/thing/service/invoke",
+                f"{MAMMOTION_API_DOMAIN}/v1/mqtt/rpc/thing/service/invoke",
                 json={
                     "args": {"content": content},
                     "deviceName": device_name,
@@ -532,7 +551,7 @@ class MammotionHTTP:
                 },
                 headers={
                     **self._headers,
-                    "Authorization": f"Bearer {self.login_info.access_token}",
+                    "Authorization": f"Bearer {login_info.access_token}",
                     "Content-Type": "application/json",
                     "User-Agent": "okhttp/4.9.3",
                     "Client-Id": self.client_id,
@@ -575,12 +594,19 @@ class MammotionHTTP:
                 },
             ) as resp:
                 if resp.status != 200:
-                    print(resp.json())
+                    body = await resp.text()
+                    _LOGGER.error(
+                        "Mammotion login (v1) failed: HTTP %s; response body: %s",
+                        resp.status,
+                        body,
+                    )
                     return Response.from_dict({"code": resp.status, "msg": "Login failed"})
                 data = await resp.json()
                 login_response = response_factory(Response[LoginResponseData], data)
                 if login_response is None or login_response.data is None:
-                    print(login_response)
+                    _LOGGER.error(
+                        "Mammotion login (v1) returned no data: %s", data
+                    )
                     return Response.from_dict({"code": resp.status, "msg": "Login failed"})
                 self.login_info = login_response.data
                 self.expires_in = login_response.data.expires_in + time.time()
@@ -674,11 +700,19 @@ class MammotionHTTP:
                 },
             ) as resp:
                 if resp.status != 200:
-                    print(resp.json())
+                    body = await resp.text()
+                    _LOGGER.error(
+                        "Mammotion login (v2) failed: HTTP %s; response body: %s",
+                        resp.status,
+                        body,
+                    )
                     return Response.from_dict({"code": resp.status, "msg": "Login failed"})
                 data = await resp.json()
                 login_response = response_factory(Response[LoginResponseData], data)
                 if login_response is None or login_response.data is None:
+                    _LOGGER.error(
+                        "Mammotion login (v2) returned no data: %s", data
+                    )
                     return Response.from_dict({"code": resp.status, "msg": "Login failed"})
                 self.login_info = login_response.data
                 self.expires_in = login_response.data.expires_in + time.time()

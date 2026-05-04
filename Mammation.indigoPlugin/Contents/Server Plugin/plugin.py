@@ -444,8 +444,6 @@ class Plugin(indigo.PluginBase):
     # Indigo async pattern (per user instructions)
     def startup(self):
         self.logger.debug("startup called")
-        # Make pymammotion's aiohttp usage compatible with aiohttp>=3.9
-        self._install_aiohttp_base_url_shim()
         # Optional but helpful to debug cloud init
 
         if Mammotion is None:
@@ -461,73 +459,6 @@ class Plugin(indigo.PluginBase):
         start_webrtc_http(self)
         self.logger.info(f"Access Video Stream: http://{self._host_ip_for_links()}:{self._webrtc_port}/webrtc/player")
         self.logger.info(f"Access Map Data: http://{self._host_ip_for_links()}:{self._webrtc_port}/map/indigo-device-id")
-
-
-    def _install_aiohttp_base_url_shim(self) -> None:
-        """
-        Make PyMammotion's aiohttp usage compatible with aiohttp>=3.9 by treating a first
-        positional string argument as base_url. Patch BOTH the symbol inside
-        pymammotion.http.http and the global aiohttp.ClientSession so any import path is covered.
-        """
-        try:
-            import aiohttp
-            from pymammotion.http import http as pm_http
-            try:
-                from pymammotion.const import MAMMOTION_API_DOMAIN as _PM_API_DOMAIN
-            except ImportError:
-                _PM_API_DOMAIN = "https://domestic.mammotion.com"
-
-            original_client_session = aiohttp.ClientSession
-            shim_logger = self.logger  # capture to avoid self use in inner fn
-            fallback_base_url = _PM_API_DOMAIN
-
-            def _patched_client_session(*args, **kwargs):
-                used_shim = False
-                base_url_value = None
-                if args and isinstance(args[0], str) and "base_url" not in kwargs:
-                    # Treat the first positional string as base_url. aiohttp>=3.9
-                    # requires base_url to be an absolute URL (with scheme), but
-                    # PyMammotion sometimes passes a bare host (e.g. jwt_info.iot
-                    # like "api-iot-business-eu-dcdn.mammotion.com") or, for some
-                    # accounts, an empty string when the JWT has no `iot` claim.
-                    # Prepend https:// for bare hosts; fall back to the Mammotion
-                    # API domain when the value is empty/scheme-only so the call
-                    # can proceed (the caller handles non-200 responses) instead
-                    # of crashing the whole login flow with "URL should be absolute".
-                    candidate = args[0].strip()
-                    if not candidate or candidate in ("http://", "https://"):
-                        shim_logger.warning(
-                            "aiohttp shim: empty base_url passed by PyMammotion "
-                            f"(likely missing 'iot' claim in JWT); falling back to {fallback_base_url!r}"
-                        )
-                        candidate = fallback_base_url
-                    elif not candidate.startswith(("http://", "https://")):
-                        candidate = "https://" + candidate.lstrip("/")
-                    kwargs["base_url"] = candidate
-                    base_url_value = candidate
-                    args = args[1:]
-                    used_shim = True
-                try:
-                    session = original_client_session(*args, **kwargs)
-                except Exception:
-                    if used_shim:
-                        shim_logger.error(
-                            f"aiohttp shim failed to apply base_url={base_url_value!r}"
-                        )
-                    raise
-                if used_shim:
-                    # One-line, low-noise confirmation that the shim was applied
-                    shim_logger.debug(
-                        f"aiohttp shim applied (base_url set to {base_url_value!r})"
-                    )
-                return session
-
-            # Patch global and module-local references
-            aiohttp.ClientSession = _patched_client_session
-            pm_http.ClientSession = _patched_client_session  # type: ignore[attr-defined]
-            self.logger.debug("Installed aiohttp base_url compatibility shim for PyMammotion (global + module)")
-        except Exception as exc:
-            self.logger.error(f"Failed to install aiohttp shim: {exc}")
 
 
     def _is_auth_error(self, ex) -> bool:
