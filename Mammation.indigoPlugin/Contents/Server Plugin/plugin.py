@@ -944,9 +944,9 @@ class Plugin(indigo.PluginBase):
                         self.logger.error(
                             f"Mammotion login failed for '{dev.name}': {ex}. "
                             f"Check account/password and try again later. "
-                            f"Retrying in {int(backoff)}s.",
-                            exc_info=True,
+                            f"Retrying in {int(backoff)}s."
                         )
+                        self.logger.debug(f"Exception info:", exc_info=True)
                         last_login_failure_msg = msg
                     else:
                         self.logger.warning(
