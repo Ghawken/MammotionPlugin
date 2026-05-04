@@ -810,8 +810,34 @@ class Plugin(indigo.PluginBase):
     # self._manager_tasks: dict[int, asyncio.Task]
 
     # ========== Session manager: login, store manager, enable cloud, bind callbacks ==========
+    def _is_login_failure(self, ex) -> bool:
+        """
+        Return True if the exception indicates the Mammotion HTTP login itself failed
+        (e.g. HTTP 403 'Access denied', no login_info issued, bad credentials).
+        Such failures will not recover on a fast retry and warrant long backoff.
+        """
+        try:
+            from pymammotion.http.model.http import UnauthorizedException  # type: ignore
+        except Exception:
+            UnauthorizedException = ()
+        if isinstance(ex, UnauthorizedException):
+            return True
+        s = str(ex) or ""
+        markers = (
+            "is not logged in",
+            "login_info is None",
+            "Access denied",
+            "'code': 403",
+            "\"code\": 403",
+            "login (v2) returned no data",
+            "Invalid username",
+            "Invalid password",
+        )
+        return any(m in s for m in markers)
+
     async def _session_manager(self, dev_id: int):
         backoff = 2.0
+        last_login_failure_msg = None
         while not self.stopThread:
             dev = indigo.devices.get(dev_id)
             if not dev or not dev.enabled or not dev.configured:
@@ -889,6 +915,10 @@ class Plugin(indigo.PluginBase):
                 self._set_auth(dev_id, True)
                 self._set_status(dev_id, "Connected")
 
+                # Reset backoff and login-failure deduplication after a successful login
+                backoff = 2.0
+                last_login_failure_msg = None
+
                 # Start periodic refresh (lightweight) and keepalive for reports
                 if dev_id in self._periodic_tasks and not self._periodic_tasks[dev_id].done():
                     self._periodic_tasks[dev_id].cancel()
@@ -901,8 +931,32 @@ class Plugin(indigo.PluginBase):
             except asyncio.CancelledError:
                 break
             except Exception as ex:
-                self.logger.error(f"Connection error for '{dev.name}': {ex}", exc_info=True)
-                self._set_basic(dev_id, connected=False, status=f"Error: {ex}")
+                if self._is_login_failure(ex):
+                    msg = str(ex)
+                    # Long backoff for auth failures – the upstream won't recover quickly,
+                    # and hammering it makes a 403 / account block worse.
+                    if backoff < 60.0:
+                        backoff = 60.0
+                    else:
+                        backoff = min(backoff * 2.0, 600.0)
+                    if msg != last_login_failure_msg:
+                        # Log full detail once per distinct error, then summarize on repeats.
+                        self.logger.error(
+                            f"Mammotion login failed for '{dev.name}': {ex}. "
+                            f"Check account/password and try again later. "
+                            f"Retrying in {int(backoff)}s.",
+                            exc_info=True,
+                        )
+                        last_login_failure_msg = msg
+                    else:
+                        self.logger.warning(
+                            f"Mammotion login still failing for '{dev.name}' (same error). "
+                            f"Retrying in {int(backoff)}s."
+                        )
+                    self._set_basic(dev_id, connected=False, status=f"Login failed: {ex}")
+                else:
+                    self.logger.error(f"Connection error for '{dev.name}': {ex}", exc_info=True)
+                    self._set_basic(dev_id, connected=False, status=f"Error: {ex}")
             finally:
                 pt = self._periodic_tasks.pop(dev_id, None)
                 if pt and not pt.done():
@@ -912,7 +966,8 @@ class Plugin(indigo.PluginBase):
                 self._set_auth(dev_id, False)
 
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2.0, 30.0)
+            if backoff < 60.0:
+                backoff = min(backoff * 2.0, 30.0)
 ##
 
     # Helper (place inside Plugin class)
