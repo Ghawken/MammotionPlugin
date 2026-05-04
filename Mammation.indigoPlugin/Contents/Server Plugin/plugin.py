@@ -170,6 +170,15 @@ class Plugin(indigo.PluginBase):
             pm.setLevel(logging.NOTSET)  # inherit from root (DEBUG)
             pm.propagate = True          # bubble up to root (file handler) AND to any parent chain
 
+            # 3b. Also surface pymammotion records via IndigoLogHandler so library-level
+            #     errors (e.g. login response body, HTTP failures) are visible in the Indigo
+            #     UI console — not only in the file log. IndigoLogHandler lives on
+            #     self.logger ("Mammotion Mower") and would NOT receive pymammotion records
+            #     via simple root propagation, so attach it directly here.
+            if getattr(self, "indigo_log_handler", None) is not None and \
+                    self.indigo_log_handler not in pm.handlers:
+                pm.addHandler(self.indigo_log_handler)
+
             # 4. Emit a test line (will appear once) so you can confirm in file quickly.
             pm.debug("[LOGTEST] pymammotion logger attached (propagate=TRUE -> root)")
 
@@ -444,8 +453,6 @@ class Plugin(indigo.PluginBase):
     # Indigo async pattern (per user instructions)
     def startup(self):
         self.logger.debug("startup called")
-        # Make pymammotion's aiohttp usage compatible with aiohttp>=3.9
-        self._install_aiohttp_base_url_shim()
         # Optional but helpful to debug cloud init
 
         if Mammotion is None:
@@ -461,41 +468,6 @@ class Plugin(indigo.PluginBase):
         start_webrtc_http(self)
         self.logger.info(f"Access Video Stream: http://{self._host_ip_for_links()}:{self._webrtc_port}/webrtc/player")
         self.logger.info(f"Access Map Data: http://{self._host_ip_for_links()}:{self._webrtc_port}/map/indigo-device-id")
-
-
-    def _install_aiohttp_base_url_shim(self) -> None:
-        """
-        Make PyMammotion's aiohttp usage compatible with aiohttp>=3.9 by treating a first
-        positional string argument as base_url. Patch BOTH the symbol inside
-        pymammotion.http.http and the global aiohttp.ClientSession so any import path is covered.
-        """
-        try:
-            import aiohttp
-            from pymammotion.http import http as pm_http
-
-            original_client_session = aiohttp.ClientSession
-            shim_logger = self.logger  # capture to avoid self use in inner fn
-
-            def _patched_client_session(*args, **kwargs):
-                used_shim = False
-                if args and isinstance(args[0], str) and "base_url" not in kwargs:
-                    # Treat the first positional string as base_url
-                    kwargs["base_url"] = args[0]
-                    args = args[1:]
-                    used_shim = True
-                try:
-                    return original_client_session(*args, **kwargs)
-                finally:
-                    # One-line, low-noise confirmation that the shim was applied
-                    if used_shim:
-                        shim_logger.debug("aiohttp shim applied (base_url set)")
-
-            # Patch global and module-local references
-            aiohttp.ClientSession = _patched_client_session
-            pm_http.ClientSession = _patched_client_session  # type: ignore[attr-defined]
-            self.logger.debug("Installed aiohttp base_url compatibility shim for PyMammotion (global + module)")
-        except Exception as exc:
-            self.logger.error(f"Failed to install aiohttp shim: {exc}")
 
 
     def _is_auth_error(self, ex) -> bool:
@@ -720,6 +692,10 @@ class Plugin(indigo.PluginBase):
                 pm = logging.getLogger("pymammotion")
                 pm.propagate = True
                 pm.setLevel(logging.NOTSET)
+                # Make sure our IndigoLogHandler is still attached so library
+                # ERROR/WARNING records remain visible in the Indigo UI.
+                if self.indigo_log_handler not in pm.handlers:
+                    pm.addHandler(self.indigo_log_handler)
                 self.logger.debug(
                     f"Logging prefs applied: Indigo={logging.getLevelName(self.indigo_log_handler.level)}, "
                     f"File={logging.getLevelName(self.plugin_file_handler.level)}"
@@ -834,8 +810,34 @@ class Plugin(indigo.PluginBase):
     # self._manager_tasks: dict[int, asyncio.Task]
 
     # ========== Session manager: login, store manager, enable cloud, bind callbacks ==========
+    def _is_login_failure(self, ex) -> bool:
+        """
+        Return True if the exception indicates the Mammotion HTTP login itself failed
+        (e.g. HTTP 403 'Access denied', no login_info issued, bad credentials).
+        Such failures will not recover on a fast retry and warrant long backoff.
+        """
+        try:
+            from pymammotion.http.model.http import UnauthorizedException  # type: ignore
+        except Exception:
+            UnauthorizedException = ()
+        if isinstance(ex, UnauthorizedException):
+            return True
+        s = str(ex) or ""
+        markers = (
+            "is not logged in",
+            "login_info is None",
+            "Access denied",
+            "'code': 403",
+            "\"code\": 403",
+            "login (v2) returned no data",
+            "Invalid username",
+            "Invalid password",
+        )
+        return any(m in s for m in markers)
+
     async def _session_manager(self, dev_id: int):
         backoff = 2.0
+        last_login_failure_msg = None
         while not self.stopThread:
             dev = indigo.devices.get(dev_id)
             if not dev or not dev.enabled or not dev.configured:
@@ -913,6 +915,10 @@ class Plugin(indigo.PluginBase):
                 self._set_auth(dev_id, True)
                 self._set_status(dev_id, "Connected")
 
+                # Reset backoff and login-failure deduplication after a successful login
+                backoff = 2.0
+                last_login_failure_msg = None
+
                 # Start periodic refresh (lightweight) and keepalive for reports
                 if dev_id in self._periodic_tasks and not self._periodic_tasks[dev_id].done():
                     self._periodic_tasks[dev_id].cancel()
@@ -925,8 +931,32 @@ class Plugin(indigo.PluginBase):
             except asyncio.CancelledError:
                 break
             except Exception as ex:
-                self.logger.error(f"Connection error for '{dev.name}': {ex}")
-                self._set_basic(dev_id, connected=False, status=f"Error: {ex}")
+                if self._is_login_failure(ex):
+                    msg = str(ex)
+                    # Long backoff for auth failures – the upstream won't recover quickly,
+                    # and hammering it makes a 403 / account block worse.
+                    if backoff < 60.0:
+                        backoff = 60.0
+                    else:
+                        backoff = min(backoff * 2.0, 600.0)
+                    if msg != last_login_failure_msg:
+                        # Log full detail once per distinct error, then summarize on repeats.
+                        self.logger.error(
+                            f"Mammotion login failed for '{dev.name}': {ex}. "
+                            f"Check account/password and try again later. "
+                            f"Retrying in {int(backoff)}s.",
+                            exc_info=True,
+                        )
+                        last_login_failure_msg = msg
+                    else:
+                        self.logger.warning(
+                            f"Mammotion login still failing for '{dev.name}' (same error). "
+                            f"Retrying in {int(backoff)}s."
+                        )
+                    self._set_basic(dev_id, connected=False, status=f"Login failed: {ex}")
+                else:
+                    self.logger.error(f"Connection error for '{dev.name}': {ex}", exc_info=True)
+                    self._set_basic(dev_id, connected=False, status=f"Error: {ex}")
             finally:
                 pt = self._periodic_tasks.pop(dev_id, None)
                 if pt and not pt.done():
@@ -936,7 +966,8 @@ class Plugin(indigo.PluginBase):
                 self._set_auth(dev_id, False)
 
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2.0, 30.0)
+            if backoff < 60.0:
+                backoff = min(backoff * 2.0, 30.0)
 ##
 
     # Helper (place inside Plugin class)

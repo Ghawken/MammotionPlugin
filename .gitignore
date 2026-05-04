@@ -1,3 +1,5 @@
 /Mammation.indigoPlugin/Contents/Packages/
 /Mammation.indigoPlugin/Contents/Server Plugin/pymammotion_new/
 /Mammation.indigoPlugin/Contents/Server Plugin/pymammotion_old/
+__pycache__/
+*.pyc
