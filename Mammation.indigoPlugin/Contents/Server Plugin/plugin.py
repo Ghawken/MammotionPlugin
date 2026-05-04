@@ -472,9 +472,14 @@ class Plugin(indigo.PluginBase):
         try:
             import aiohttp
             from pymammotion.http import http as pm_http
+            try:
+                from pymammotion.const import MAMMOTION_API_DOMAIN as _PM_API_DOMAIN
+            except ImportError:
+                _PM_API_DOMAIN = "https://domestic.mammotion.com"
 
             original_client_session = aiohttp.ClientSession
             shim_logger = self.logger  # capture to avoid self use in inner fn
+            fallback_base_url = _PM_API_DOMAIN
 
             def _patched_client_session(*args, **kwargs):
                 used_shim = False
@@ -483,10 +488,20 @@ class Plugin(indigo.PluginBase):
                     # Treat the first positional string as base_url. aiohttp>=3.9
                     # requires base_url to be an absolute URL (with scheme), but
                     # PyMammotion sometimes passes a bare host (e.g. jwt_info.iot
-                    # like "api-iot-business-eu-dcdn.mammotion.com"). Prepend
-                    # https:// in that case so aiohttp/yarl accepts it.
-                    candidate = args[0]
-                    if not candidate.startswith(("http://", "https://")):
+                    # like "api-iot-business-eu-dcdn.mammotion.com") or, for some
+                    # accounts, an empty string when the JWT has no `iot` claim.
+                    # Prepend https:// for bare hosts; fall back to the Mammotion
+                    # API domain when the value is empty/scheme-only so the call
+                    # can proceed (the caller handles non-200 responses) instead
+                    # of crashing the whole login flow with "URL should be absolute".
+                    candidate = args[0].strip()
+                    if not candidate or candidate in ("http://", "https://"):
+                        shim_logger.warning(
+                            "aiohttp shim: empty base_url passed by PyMammotion "
+                            f"(likely missing 'iot' claim in JWT); falling back to {fallback_base_url!r}"
+                        )
+                        candidate = fallback_base_url
+                    elif not candidate.startswith(("http://", "https://")):
                         candidate = "https://" + candidate.lstrip("/")
                     kwargs["base_url"] = candidate
                     base_url_value = candidate
