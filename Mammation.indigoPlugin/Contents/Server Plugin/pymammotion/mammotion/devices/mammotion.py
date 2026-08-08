@@ -15,7 +15,7 @@ from pymammotion.data.model.device import MowingDevice
 from pymammotion.data.model.enums import ConnectionPreference
 from pymammotion.http.http import MammotionHTTP
 from pymammotion.http.model.camera_stream import StreamSubscriptionResponse, VideoResourceResponse
-from pymammotion.http.model.http import DeviceRecord, Response
+from pymammotion.http.model.http import DeviceRecord, Response, UnauthorizedException
 from pymammotion.mammotion.devices.mammotion_cloud import MammotionCloud
 from pymammotion.mammotion.devices.mammotion_mower_ble import MammotionMowerBLEDevice
 from pymammotion.mammotion.devices.managers.managers import AbstractDeviceManager
@@ -409,7 +409,14 @@ class Mammotion:
     async def login(self, account: str, password: str) -> CloudIOTGateway:
         """Login to mammotion cloud."""
         mammotion_http = MammotionHTTP()
-        await mammotion_http.login_v2(account, password)
+        login_response = await mammotion_http.login_v2(account, password)
+        if mammotion_http.login_info is None:
+            # login_v2 reports rejection by returning a bare Response rather than
+            # raising, so stop here — otherwise the next call blows up on a null
+            # access token and the server's actual message is lost.
+            msg = getattr(login_response, "msg", None) or "Login failed"
+            code = getattr(login_response, "code", None)
+            raise UnauthorizedException(f"Mammotion login (v2) returned no data: {msg} (code {code})")
         await mammotion_http.get_user_device_page()
         device_list = await mammotion_http.get_user_device_list()
         _LOGGER.debug("device_list: %s", device_list)

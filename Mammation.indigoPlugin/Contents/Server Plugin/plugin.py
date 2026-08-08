@@ -835,6 +835,23 @@ class Plugin(indigo.PluginBase):
         )
         return any(m in s for m in markers)
 
+    def _is_account_locked(self, ex) -> bool:
+        """
+        Return True if Mammotion has flagged/deactivated the account (API code 40212).
+
+        This is not a credential problem and it will not clear on its own while we
+        keep knocking — each further attempt extends the lockout. Retrying at the
+        normal auth cadence is actively harmful, so callers must back right off and
+        tell the user to sort it out in the Mammotion app.
+        """
+        s = str(ex) or ""
+        markers = (
+            "40212",
+            "activity is abnormal",
+            "has been deactivated",
+        )
+        return any(m in s for m in markers)
+
     async def _session_manager(self, dev_id: int):
         backoff = 2.0
         last_login_failure_msg = None
@@ -931,7 +948,22 @@ class Plugin(indigo.PluginBase):
             except asyncio.CancelledError:
                 break
             except Exception as ex:
-                if self._is_login_failure(ex):
+                if self._is_account_locked(ex):
+                    # Mammotion has deactivated the account. Only a human can clear
+                    # this (log in via the Mammotion app), and every retry we make
+                    # in the meantime prolongs it — so wait an hour between tries.
+                    backoff = 3600.0
+                    msg = str(ex)
+                    if msg != last_login_failure_msg:
+                        self.logger.error(
+                            f"Mammotion has deactivated account '{account}' for '{dev.name}': {ex}. "
+                            f"Sign in to the Mammotion mobile app to clear the lock (a password reset "
+                            f"may be required), then reload this plugin. "
+                            f"Backing off for {int(backoff / 60)} minutes — further attempts extend the lockout."
+                        )
+                        last_login_failure_msg = msg
+                    self._set_basic(dev_id, connected=False, status="Account deactivated by Mammotion")
+                elif self._is_login_failure(ex):
                     msg = str(ex)
                     # Long backoff for auth failures – the upstream won't recover quickly,
                     # and hammering it makes a 403 / account block worse.
