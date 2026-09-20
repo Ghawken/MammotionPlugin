@@ -317,7 +317,7 @@ class MammotionHTTP:
             return Response.from_dict(data)
 
     @refresh_token_decorator
-    async def get_stream_subscription(self, iot_id: str, is_yuka: bool) -> Response[StreamSubscriptionResponse]:
+    async def get_stream_subscription(self, iot_id: str, is_yuka: bool = False) -> Response[StreamSubscriptionResponse]:
         # Prepare the payload with cameraStates based on is_yuka flag
         """Fetches stream subscription data for a given IoT device."""
 

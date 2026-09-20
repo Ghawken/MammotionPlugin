@@ -526,7 +526,7 @@ class Mammotion:
             _LOGGER.debug(_stream_response)
             return _stream_response
         else:
-            _stream_response = await device.mammotion_http.get_stream_subscription(iot_id)
+            _stream_response = await device.mammotion_http.get_stream_subscription(iot_id, DeviceType.is_yuka(name))
             _LOGGER.debug(_stream_response)
             return _stream_response
 
