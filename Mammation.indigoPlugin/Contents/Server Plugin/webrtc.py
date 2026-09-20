@@ -1223,7 +1223,7 @@ def start_webrtc_http(plugin):
                 try:
                     from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
                     cmd = MammotionCommand(mower_name, int(account_id)).device_agora_join_channel_with_position(enter_state=1)
-                    await device.cloud_client.send_cloud_command(device.iot_id, cmd)
+                    await plugin._send_raw_cloud(device, cmd)
                 except Exception as ex:
                     # Reuse the plugin's central auth detector
                     try:
@@ -1241,7 +1241,7 @@ def start_webrtc_http(plugin):
                             cmd2 = _MC(mower_name, int(account_id)).device_agora_join_channel_with_position(
                                 enter_state=1
                             )
-                            await device.cloud_client.send_cloud_command(device.iot_id, cmd2)
+                            await plugin._send_raw_cloud(device, cmd2)
                         except Exception as ex2:
                             return _json_error(f"join failed: {ex2}")
                     else:
@@ -1310,7 +1310,7 @@ def start_webrtc_http(plugin):
                             device = mgr.get_device_by_name(mower_name)
                             from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
                             cmd = MammotionCommand(mower_name, int(account_id)).device_agora_join_channel_with_position(enter_state=0)
-                            await device.cloud_client.send_cloud_command(device.iot_id, cmd)
+                            await plugin._send_raw_cloud(device, cmd)
                     except Exception as ex:
                         plugin.logger.error(f"Stop stream leave failed: {ex}")
                 plugin._webrtc_tokens = {}

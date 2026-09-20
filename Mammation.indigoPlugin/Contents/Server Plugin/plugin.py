@@ -246,6 +246,23 @@ class Plugin(indigo.PluginBase):
                 pass
             return [("err", "Error building list")]
 
+    @staticmethod
+    async def _send_raw_cloud(device, command: bytes):
+        """Send raw protobuf command bytes via the device's actual cloud transport.
+
+        device.cloud_client is always the Aliyun gateway, but mowers that have
+        migrated to the Mammotion MQTT platform (post-2025 firmware) are unbound
+        there and every Aliyun send fails with 29004 'device is unbind'. The
+        library binds the correct transport to device.cloud.mqtt, so route
+        through that and only fall back to the Aliyun gateway when the device
+        has no cloud transport attached.
+        """
+        cloud = getattr(device, "cloud", None)
+        mqtt = getattr(cloud, "mqtt", None) if cloud else None
+        if mqtt is not None:
+            return await mqtt.send_command(device.iot_id, command)
+        return await device.cloud_client.send_cloud_command(device.iot_id, command)
+
     # New: async fetch of areas from the library (best-effort across library versions)
     async def ensure_manual_mode(self, dev_id):
         indigo_dev = indigo.devices.get(dev_id)
@@ -260,7 +277,7 @@ class Plugin(indigo.PluginBase):
         from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
         try:
             cmd = MammotionCommand(mower_name, int(account_id)).device_remote_control_with_position(enter_state=1)
-            await device.cloud_client.send_cloud_command(device.iot_id, cmd)
+            await self._send_raw_cloud(device, cmd)
             self.logger.info("Entered remote manual control mode")
         except Exception as ex:
             self.logger.error(f"Enter manual control failed: {ex}")
